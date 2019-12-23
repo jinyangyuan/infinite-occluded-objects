@@ -6,36 +6,29 @@ from torch.utils.data import Dataset, DataLoader
 class CustomDataset(Dataset):
 
     def __init__(self, data):
-        self.images = data['image']
-        self.backgrounds = data['background']
+        self.data = torch.tensor(data)
 
     def __getitem__(self, idx):
-        image = torch.FloatTensor(self.images[idx])
-        background = torch.FloatTensor(self.backgrounds[idx])
-        return image, background
+        return self.data[idx]
 
     def __len__(self):
-        return self.images.shape[0]
+        return self.data.shape[0]
 
 
-def get_dataloader(args):
+def get_dataloaders(args):
+    key_list = ['train', 'valid'] if args.train else ['test']
     with h5py.File(args.path_data, 'r', libver='latest', swmr=True) as f:
-        data = {
-            key: {
-                'image': f['Image'][key][()],
-                'background': f['Background'][key][()],
-            }
-            for key in (['train', 'valid'] if args.train else ['test'])
-        }
-    dataset = {key: CustomDataset(data[key]) for key in data}
-    dataloader = {
+        data = {key: f[key][()] for key in key_list}
+    image_planes, image_full_height, image_full_width = data[key_list[0]].shape[-3:]
+    datasets = {key: CustomDataset(val) for key, val in data.items()}
+    dataloaders = {
         key: DataLoader(
             val,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             shuffle=key == 'train',
-            drop_last=key == 'train'
+            drop_last=key == 'train',
         )
-        for key, val in dataset.items()
+        for key, val in datasets.items()
     }
-    return dataloader
+    return dataloaders, image_planes, image_full_height, image_full_width

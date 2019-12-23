@@ -1,0 +1,106 @@
+path_data: null
+folder: null
+train: null
+
+gaussian_std: 0.3
+lr: 1.0e-4
+max_objects: 4
+batch_size: 128
+num_workers: 1
+num_epochs: 100
+num_steps: 2
+num_tests: 5
+
+coef_param_dict:
+    recon:
+        epochs: [50]
+        values: [1.0, 1.0, 0.0]
+        linears: [1, 1]
+    back_prior:
+        epochs: [50]
+        values: [1.0, 0.0, 0.0]
+        linears: [1, 1]
+    back_diff:
+        epochs: []
+        values: [1.0, 1.0]
+        linears: [1]
+    apc_diff:
+        epochs: []
+        values: [1.0, 1.0]
+        linears: [1]
+
+state_main_size: 256
+state_back_size: 256
+state_full_size: 256
+state_crop_size: 256
+
+init_back_channel_list: [8, 8, 16, 16]
+init_back_kernel_list: [3, 3, 3, 3]
+init_back_stride_list: [1, 2, 1, 2]
+init_back_hidden_list: []
+init_back_size: 256
+
+init_full_channel_list: [8, 8, 16, 16]
+init_full_kernel_list: [3, 3, 3, 3]
+init_full_stride_list: [1, 2, 1, 2]
+init_full_main_hidden_list: []
+init_full_main_size: 256
+init_full_full_hidden_list: [256]
+init_full_full_size: 256
+
+init_crop_channel_list: [8, 8, 16, 16]
+init_crop_kernel_list: [3, 3, 3, 3]
+init_crop_stride_list: [1, 2, 1, 2]
+init_crop_hidden_list: []
+init_crop_size: 256
+
+upd_back_channel_list: [8, 8, 16, 16]
+upd_back_kernel_list: [3, 3, 3, 3]
+upd_back_stride_list: [1, 2, 1, 2]
+upd_back_hidden_list: []
+upd_back_size: 256
+
+upd_full_channel_list: [8, 8, 16, 16]
+upd_full_kernel_list: [3, 3, 3, 3]
+upd_full_stride_list: [1, 2, 1, 2]
+upd_full_hidden_list: []
+upd_full_size: 256
+
+upd_crop_channel_list: [8, 8, 16, 16]
+upd_crop_kernel_list: [3, 3, 3, 3]
+upd_crop_stride_list: [1, 2, 1, 2]
+upd_crop_hidden_list: []
+upd_crop_size: 256
+
+latent_back_size: 32
+enc_back_hidden_list: [256]
+dec_back_color_hidden_list: [16, 16]
+dec_back_diff_channel_list_rev: [8, 8, 16, 16]
+dec_back_diff_kernel_list_rev: [3, 3, 3, 3]
+dec_back_diff_stride_list_rev: [1, 2, 1, 2]
+dec_back_diff_hidden_list_rev: [256]
+
+prior_pres_alpha: 1.0e-3
+enc_pres_hidden_list: [128, 64]
+
+prior_where_mu: [0.0, 0.0, 0.0, 0.0]
+prior_where_std: [0.5, 0.5, 0.5, 0.5]
+enc_where_hidden_list: [256, 256]
+
+latent_what_size: 64
+enc_what_hidden_list: [256]
+dec_apc_color_hidden_list: [16, 16]
+dec_apc_diff_channel_list_rev: [8, 8, 16, 16]
+dec_apc_diff_kernel_list_rev: [3, 3, 3, 3]
+dec_apc_diff_stride_list_rev: [1, 2, 1, 2]
+dec_apc_diff_hidden_list_rev: [256]
+dec_shp_channel_list_rev: [8, 8, 16, 16]
+dec_shp_kernel_list_rev: [3, 3, 3, 3]
+dec_shp_stride_list_rev: [1, 2, 1, 2]
+dec_shp_hidden_list_rev: [256]
+
+file_args: args.yaml
+file_log: train.log
+file_model: model.pth
+file_result_base: result_{}.h5
+loss_weights: null

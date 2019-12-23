@@ -1,22 +1,26 @@
 import argparse
 import numpy as np
 import os
-from common import create_dataset, generate_dataset
+from common import generate_objects, create_dataset
 
 
-def main():
+if __name__ == '__main__':
     # Arguments
     parser = argparse.ArgumentParser()
+    parser.add_argument('--name')
     parser.add_argument('--folder_outputs')
     parser.add_argument('--occlusion', type=int)
     parser.add_argument('--num_objects_all', type=int, nargs='+')
-    parser.add_argument('--image_size', type=int, default=48)
     parser.add_argument('--num_train', type=int, default=50000)
     parser.add_argument('--num_valid', type=int, default=10000)
     parser.add_argument('--num_test', type=int, default=10000)
+    parser.add_argument('--image_height', type=int, default=48)
+    parser.add_argument('--image_width', type=int, default=48)
     parser.add_argument('--seed', type=int, default=265076)
     args = parser.parse_args()
-    # Convert Shapes
+    if not os.path.exists(args.folder_outputs):
+        os.mkdir(args.folder_outputs)
+    # Elements
     square = np.array(
         [[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
          [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
@@ -45,13 +49,12 @@ def main():
          [0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0],
          [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
          [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]])
-    images_all = [square, triangle, triangle[::-1, :].copy()]
-    data = {key: images_all for key in ['train', 'valid', 'test']}
-    # Create dataset
-    images, labels_ami, labels_mse = generate_dataset(args, data)
-    name = 'shapes_{}'.format('_'.join([str(n) for n in args.num_objects_all]))
-    create_dataset(os.path.join(args.folder_outputs, name), images, labels_ami, labels_mse)
-
-
-if __name__ == '__main__':
-    main()
+    elements = [square, triangle, triangle[::-1, :].copy()]
+    elements = [n[None].repeat(2, axis=0) for n in elements]
+    back = np.zeros((2, args.image_height, args.image_width))
+    back[-1] = 1
+    elements = {'back': back, 'objects': elements}
+    elements = {key: elements for key in ['train', 'valid', 'test']}
+    # Objects
+    objects = generate_objects(args, elements)
+    create_dataset(os.path.join(args.folder_outputs, args.name), objects)

@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
-from building_block import EncoderConv, DecoderConv, FCLayer
+import torch.nn.functional
+from building_block import FC, EncoderConv, DecoderConv
 
 
 def normalize_image(x):
@@ -13,176 +14,94 @@ def restore_image(x):
 
 def reparameterize_normal(mu, logvar):
     std = torch.exp(0.5 * logvar)
-    eps = torch.randn_like(std)
-    return eps.mul(std).add_(mu)
+    noise = torch.randn_like(std)
+    return mu + std * noise
 
 
 class UpdaterBase(nn.Module):
 
-    def __init__(self, num_planes_in, plane_size_in, config_channels, config_resample, config_hidden, state_size):
+    def __init__(self, channel_list, kernel_list, stride_list, hidden_list, num_planes_in, plane_height_in,
+                 plane_width_in, num_features_out, state_size):
         super(UpdaterBase, self).__init__()
-        self.conv = EncoderConv(config_channels, config_resample, num_planes_in, plane_size_in)
-        layers = []
-        num_features_in = self.conv.num_features
-        for num_features_out in config_hidden:
-            layers.append(FCLayer(num_features_in, num_features_out))
-            num_features_in = num_features_out
-        self.fc = nn.Sequential(*layers)
-        self.lstm = nn.LSTMCell(num_features_in, state_size)
+        self.net = EncoderConv(
+            channel_list=channel_list,
+            kernel_list=kernel_list,
+            stride_list=stride_list,
+            hidden_list=hidden_list,
+            num_planes_in=num_planes_in,
+            plane_height_in=plane_height_in,
+            plane_width_in=plane_width_in,
+            num_features_out=num_features_out,
+            last_activation=True,
+        )
+        self.lstm = nn.LSTMCell(num_features_out, state_size)
 
-    def forward(self, x, states=None):
-        x = normalize_image(x)
-        x = self.conv(x)
-        x = x.view(x.shape[0], -1)
-        x = self.fc(x)
+    def forward(self, inputs, states=None):
+        x = normalize_image(inputs)
+        x = self.net(x)
         states = self.lstm(x, states)
         return states
-
-
-class VAEEncoder(nn.Module):
-
-    def __init__(self, num_features_in, config_hidden, vae_size, vae_groups):
-        super(VAEEncoder, self).__init__()
-        self.vae_size = vae_size
-        layers = []
-        for num_features_out in config_hidden:
-            layers.append(FCLayer(num_features_in, num_features_out))
-            num_features_in = num_features_out
-        layers.append(nn.Linear(num_features_in, vae_size * vae_groups))
-        self.fc = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.fc(x).split(self.vae_size, dim=-1)
-
-
-class VAEDecoderSimple(nn.Module):
-
-    def __init__(self, num_planes_out, plane_size_out, config_hidden, vae_size):
-        super(VAEDecoderSimple, self).__init__()
-        layers = []
-        num_features_in = vae_size
-        for num_features_out in config_hidden:
-            layers.append(FCLayer(num_features_in, num_features_out))
-            num_features_in = num_features_out
-        layers.append(nn.Linear(num_features_in, num_planes_out))
-        self.fc = nn.Sequential(*layers)
-        self.plane_size_out = plane_size_out
-
-    def forward(self, x):
-        x = self.fc(x)
-        x = x[..., None, None].expand(-1, -1, self.plane_size_out, self.plane_size_out)
-        return x
-
-
-class VAEDecoderComplex(nn.Module):
-
-    def __init__(self, num_planes_out, plane_size_out, config_channels, config_resample, config_hidden, vae_size):
-        super(VAEDecoderComplex, self).__init__()
-        conv = DecoderConv(config_channels, config_resample, num_planes_out, plane_size_out)
-        layers = []
-        num_features_in = vae_size
-        for num_features_out in config_hidden:
-            layers.append(FCLayer(num_features_in, num_features_out))
-            num_features_in = num_features_out
-        layers.append(FCLayer(num_features_in, conv.num_features))
-        self.fc = nn.Sequential(*layers)
-        self.conv = conv
-
-    def forward(self, x):
-        x = self.fc(x)
-        x = x.view(x.shape[0], self.conv.num_planes, self.conv.plane_size, self.conv.plane_size)
-        x = self.conv(x)
-        return x
-
-
-class InitializerWhere(nn.Module):
-
-    def __init__(self, args):
-        super(InitializerWhere, self).__init__()
-        num_planes_in = args.image_channels * 2
-        plane_size_in = args.image_full_size
-        config_channels = args.init_where_channels
-        config_resample = args.init_where_resample
-        config_hidden_1 = args.init_where_hidden_1
-        config_hidden_2 = args.init_where_hidden_2
-        state_size_base = args.state_size_base
-        state_size_where = args.state_size_where
-        self.conv = EncoderConv(config_channels, config_resample, num_planes_in, plane_size_in)
-        layers = []
-        num_features_in = self.conv.num_features
-        for num_features_out in config_hidden_1:
-            layers.append(FCLayer(num_features_in, num_features_out))
-            num_features_in = num_features_out
-        self.fc_1 = nn.Sequential(*layers)
-        self.lstm_base = nn.LSTMCell(num_features_in, state_size_base)
-        layers = []
-        num_features_in = state_size_base
-        for num_features_out in config_hidden_2:
-            layers.append(FCLayer(num_features_in, num_features_out))
-            num_features_in = num_features_out
-        self.fc_2 = nn.Sequential(*layers)
-        self.lstm_where = nn.LSTMCell(num_features_in, state_size_where)
-
-    def forward(self, x, states_base):
-        x = normalize_image(x)
-        x = self.conv(x)
-        x = x.view(x.shape[0], -1)
-        x = self.fc_1(x)
-        states_base = self.lstm_base(x, states_base)
-        x = self.fc_2(states_base[0])
-        states_where = self.lstm_where(x)
-        return states_where, states_base
-
-
-class InitializerWhat(UpdaterBase):
-
-    def __init__(self, args):
-        super(InitializerWhat, self).__init__(
-            num_planes_in=args.image_channels * 2,
-            plane_size_in=args.image_crop_size,
-            config_channels=args.init_what_channels,
-            config_resample=args.init_what_resample,
-            config_hidden=args.init_what_hidden,
-            state_size=args.state_size_what,
-        )
 
 
 class InitializerBack(UpdaterBase):
 
     def __init__(self, args):
         super(InitializerBack, self).__init__(
-            num_planes_in=args.image_channels,
-            plane_size_in=args.image_full_size,
-            config_channels=args.init_back_channels,
-            config_resample=args.init_back_resample,
-            config_hidden=args.init_back_hidden,
-            state_size=args.state_size_back,
+            channel_list=args.init_back_channel_list,
+            kernel_list=args.init_back_kernel_list,
+            stride_list=args.init_back_stride_list,
+            hidden_list=args.init_back_hidden_list,
+            num_planes_in=args.image_planes,
+            plane_height_in=args.image_full_height,
+            plane_width_in=args.image_full_width,
+            num_features_out=args.init_back_size,
+            state_size=args.state_back_size,
         )
 
 
-class UpdaterWhere(UpdaterBase):
+class InitializerFull(nn.Module):
 
     def __init__(self, args):
-        super(UpdaterWhere, self).__init__(
-            num_planes_in=args.image_channels * 4,
-            plane_size_in=args.image_full_size,
-            config_channels=args.upd_where_channels,
-            config_resample=args.upd_where_resample,
-            config_hidden=args.upd_where_hidden,
-            state_size=args.state_size_where,
+        super(InitializerFull, self).__init__()
+        self.upd_main = UpdaterBase(
+            channel_list=args.init_full_channel_list,
+            kernel_list=args.init_full_kernel_list,
+            stride_list=args.init_full_stride_list,
+            hidden_list=args.init_full_main_hidden_list,
+            num_planes_in=args.image_planes * 2 + 1,
+            plane_height_in=args.image_full_height,
+            plane_width_in=args.image_full_width,
+            num_features_out=args.init_full_main_size,
+            state_size=args.state_main_size,
         )
+        self.net_full = FC(
+            hidden_list=args.init_full_full_hidden_list,
+            num_features_in=args.state_main_size,
+            num_features_out=args.init_full_full_size,
+            last_activation=True,
+        )
+        self.lstm_full = nn.LSTMCell(args.init_full_full_size, args.state_full_size)
+
+    def forward(self, inputs, states_main):
+        states_main = self.upd_main(inputs, states_main)
+        x = self.net_full(states_main[0])
+        states_full = self.lstm_full(x)
+        return states_full, states_main
 
 
-class UpdaterWhat(UpdaterBase):
+class InitializerCrop(UpdaterBase):
 
     def __init__(self, args):
-        super(UpdaterWhat, self).__init__(
-            num_planes_in=args.image_channels * 4,
-            plane_size_in=args.image_crop_size,
-            config_channels=args.upd_what_channels,
-            config_resample=args.upd_what_resample,
-            config_hidden=args.upd_what_hidden,
-            state_size=args.state_size_what,
+        super(InitializerCrop, self).__init__(
+            channel_list=args.init_crop_channel_list,
+            kernel_list=args.init_crop_kernel_list,
+            stride_list=args.init_crop_stride_list,
+            hidden_list=args.init_crop_hidden_list,
+            num_planes_in=args.image_planes * 2 + 1,
+            plane_height_in=args.image_crop_height,
+            plane_width_in=args.image_crop_width,
+            num_features_out=args.init_crop_size,
+            state_size=args.state_crop_size,
         )
 
 
@@ -190,129 +109,213 @@ class UpdaterBack(UpdaterBase):
 
     def __init__(self, args):
         super(UpdaterBack, self).__init__(
-            num_planes_in=args.image_channels * 3,
-            plane_size_in=args.image_full_size,
-            config_channels=args.upd_back_channels,
-            config_resample=args.upd_back_resample,
-            config_hidden=args.upd_back_hidden,
-            state_size=args.state_size_back,
+            channel_list=args.upd_back_channel_list,
+            kernel_list=args.upd_back_kernel_list,
+            stride_list=args.upd_back_stride_list,
+            hidden_list=args.upd_back_hidden_list,
+            num_planes_in=args.image_planes * 3 + 1,
+            plane_height_in=args.image_full_height,
+            plane_width_in=args.image_full_width,
+            num_features_out=args.upd_back_size,
+            state_size=args.state_back_size,
         )
 
 
-class VAEPres(nn.Module):
+class UpdaterFull(UpdaterBase):
 
     def __init__(self, args):
-        super(VAEPres, self).__init__()
-        self.enc = VAEEncoder(
-            num_features_in=args.state_size_where + args.state_size_what,
-            config_hidden=args.enc_pres_hidden,
-            vae_size=1,
-            vae_groups=3,
+        super(UpdaterFull, self).__init__(
+            channel_list=args.upd_full_channel_list,
+            kernel_list=args.upd_full_kernel_list,
+            stride_list=args.upd_full_stride_list,
+            hidden_list=args.upd_full_hidden_list,
+            num_planes_in=args.image_planes * 4 + 2,
+            plane_height_in=args.image_full_height,
+            plane_width_in=args.image_full_width,
+            num_features_out=args.upd_full_size,
+            state_size=args.state_full_size,
         )
 
-    def forward(self, x1, x2):
-        x = torch.cat([x1, x2], dim=-1)
-        logits_tau1, logits_tau2, logits_zeta = self.enc(x)
+
+class UpdaterCrop(UpdaterBase):
+
+    def __init__(self, args):
+        super(UpdaterCrop, self).__init__(
+            channel_list=args.upd_crop_channel_list,
+            kernel_list=args.upd_crop_kernel_list,
+            stride_list=args.upd_crop_stride_list,
+            hidden_list=args.upd_crop_hidden_list,
+            num_planes_in=args.image_planes * 4 + 2,
+            plane_height_in=args.image_crop_height,
+            plane_width_in=args.image_crop_width,
+            num_features_out=args.upd_crop_size,
+            state_size=args.state_crop_size,
+        )
+
+
+class EncDecBack(nn.Module):
+
+    def __init__(self, args):
+        super(EncDecBack, self).__init__()
+        self.enc = FC(
+            hidden_list=args.enc_back_hidden_list,
+            num_features_in=args.state_back_size,
+            num_features_out=args.latent_back_size * 2,
+            last_activation=False,
+        )
+        self.dec_color = FC(
+            hidden_list=args.dec_back_color_hidden_list,
+            num_features_in=args.latent_back_size,
+            num_features_out=args.image_planes,
+            last_activation=False,
+        )
+        self.dec_diff = DecoderConv(
+            channel_list_rev=args.dec_back_diff_channel_list_rev,
+            kernel_list_rev=args.dec_back_diff_kernel_list_rev,
+            stride_list_rev=args.dec_back_diff_stride_list_rev,
+            hidden_list_rev=args.dec_back_diff_hidden_list_rev,
+            num_features_in=args.latent_back_size,
+            num_planes_out=args.image_planes,
+            plane_height_out=args.image_full_height,
+            plane_width_out=args.image_full_width,
+        )
+
+    def encode(self, x):
+        back_mu, back_logvar = self.enc(x).chunk(2, dim=-1)
+        return back_mu, back_logvar
+
+    def decode(self, back_mu, back_logvar):
+        sample = reparameterize_normal(back_mu, back_logvar)
+        back_color = self.dec_color(sample)[..., None, None]
+        back_diff = self.dec_diff(sample)
+        back = restore_image(back_color + back_diff)
+        return back, back_diff
+
+    def forward(self, x):
+        back_mu, back_logvar = self.encode(x)
+        back, back_diff = self.decode(back_mu, back_logvar)
+        result = {'back': back, 'back_diff': back_diff, 'back_mu': back_mu, 'back_logvar': back_logvar}
+        return result
+
+
+class EncDecFull(nn.Module):
+
+    def __init__(self, args):
+        super(EncDecFull, self).__init__()
+        self.enc_pres = FC(
+            hidden_list=args.enc_pres_hidden_list,
+            num_features_in=args.state_full_size,
+            num_features_out=3,
+            last_activation=False,
+        )
+        self.enc_where_0 = FC(
+            hidden_list=args.enc_where_hidden_list,
+            num_features_in=args.state_full_size,
+            num_features_out=8,
+            last_activation=False,
+        )
+        self.enc_where_1 = FC(
+            hidden_list=args.enc_where_hidden_list,
+            num_features_in=args.state_full_size,
+            num_features_out=8,
+            last_activation=False,
+        )
+
+    def encode(self, x):
+        logits_tau1, logits_tau2, logits_zeta = self.enc_pres(x).chunk(3, dim=-1)
         tau1 = nn.functional.softplus(logits_tau1)
         tau2 = nn.functional.softplus(logits_tau2)
         zeta = torch.sigmoid(logits_zeta)
-        return tau1, tau2, zeta, logits_zeta
+        where_mu_0, where_logvar_0 = self.enc_where_0(x).chunk(2, dim=-1)
+        where_mu_1, where_logvar_1 = self.enc_where_1(x).chunk(2, dim=-1)
+        where_mu = zeta * where_mu_1 + (1 - zeta) * where_mu_0
+        where_logvar = zeta * where_logvar_1 + (1 - zeta) * where_logvar_0
+        return tau1, tau2, zeta, logits_zeta, where_mu, where_logvar
 
-
-class VAEScaleTrans(nn.Module):
-
-    def __init__(self, args):
-        super(VAEScaleTrans, self).__init__()
-        self.enc = VAEEncoder(
-            num_features_in=args.state_size_where,
-            config_hidden=args.enc_scl_trs_hidden,
-            vae_size=4,
-            vae_groups=2,
-        )
+    @staticmethod
+    def decode(where_mu, where_logvar):
+        sample = reparameterize_normal(where_mu, where_logvar)
+        scl = torch.sigmoid(sample[..., :2])
+        trs = torch.tanh(sample[..., 2:])
+        return scl, trs
 
     def forward(self, x):
-        mu, logvar = self.enc(x)
-        sample = reparameterize_normal(mu, logvar)
-        scale = torch.sigmoid(sample[..., :2])
-        trans = torch.tanh(sample[..., 2:])
-        return scale, trans, mu, logvar
+        tau1, tau2, zeta, logits_zeta, where_mu, where_logvar = self.encode(x)
+        scl, trs = self.decode(where_mu, where_logvar)
+        result = {
+            'scl': scl, 'trs': trs,
+            'tau1': tau1, 'tau2': tau2, 'zeta': zeta, 'logits_zeta': logits_zeta,
+            'where_mu': where_mu, 'where_logvar': where_logvar,
+        }
+        return result
 
 
-class VAEShapeAppear(nn.Module):
+class EncDecCrop(nn.Module):
 
     def __init__(self, args):
-        super(VAEShapeAppear, self).__init__()
-        vae_size_shape = args.vae_size_shp
-        vae_size_appear = args.vae_size_apc
-        vae_size = vae_size_shape + vae_size_appear
-        self.vae_size_split = vae_size_shape
-        # Encoder
-        self.enc_0 = VAEEncoder(
-            num_features_in=args.state_size_what,
-            config_hidden=args.enc_shp_apc_hidden,
-            vae_size=vae_size,
-            vae_groups=2,
+        super(EncDecCrop, self).__init__()
+        self.enc_0 = FC(
+            hidden_list=args.enc_what_hidden_list,
+            num_features_in=args.state_crop_size,
+            num_features_out=args.latent_what_size * 2,
+            last_activation=False,
         )
-        self.enc_1 = VAEEncoder(
-            num_features_in=args.state_size_what,
-            config_hidden=args.enc_shp_apc_hidden,
-            vae_size=vae_size,
-            vae_groups=2,
+        self.enc_1 = FC(
+            hidden_list=args.enc_what_hidden_list,
+            num_features_in=args.state_crop_size,
+            num_features_out=args.latent_what_size * 2,
+            last_activation=False,
         )
-        # Decoder
-        self.dec_shape = VAEDecoderComplex(
+        self.dec_apc_color = FC(
+            hidden_list=args.dec_apc_color_hidden_list,
+            num_features_in=args.latent_what_size,
+            num_features_out=args.image_planes,
+            last_activation=False,
+        )
+        self.dec_apc_diff = DecoderConv(
+            channel_list_rev=args.dec_apc_diff_channel_list_rev,
+            kernel_list_rev=args.dec_apc_diff_kernel_list_rev,
+            stride_list_rev=args.dec_apc_diff_stride_list_rev,
+            hidden_list_rev=args.dec_apc_diff_hidden_list_rev,
+            num_features_in=args.latent_what_size,
+            num_planes_out=args.image_planes,
+            plane_height_out=args.image_crop_height,
+            plane_width_out=args.image_crop_width,
+        )
+        self.dec_shp = DecoderConv(
+            channel_list_rev=args.dec_shp_channel_list_rev,
+            kernel_list_rev=args.dec_shp_kernel_list_rev,
+            stride_list_rev=args.dec_shp_stride_list_rev,
+            hidden_list_rev=args.dec_shp_hidden_list_rev,
+            num_features_in=args.latent_what_size,
             num_planes_out=1,
-            plane_size_out=args.image_crop_size,
-            config_channels=args.dec_shp_channels,
-            config_resample=args.dec_shp_resample,
-            config_hidden=args.dec_shp_hidden,
-            vae_size=vae_size_shape,
-        )
-        self.dec_appear = VAEDecoderSimple(
-            num_planes_out=args.image_channels,
-            plane_size_out=args.image_crop_size,
-            config_hidden=args.dec_apc_hidden,
-            vae_size=vae_size_appear,
+            plane_height_out=args.image_crop_height,
+            plane_width_out=args.image_crop_width,
         )
 
-    def forward(self, x, zeta):
-        mu_0, logvar_0 = self.enc_0(x)
-        mu_1, logvar_1 = self.enc_1(x)
-        mu = zeta * mu_1 + (1 - zeta) * mu_0
-        logvar = zeta * logvar_1 + (1 - zeta) * logvar_0
-        sample = reparameterize_normal(mu, logvar)
-        sample_shape = sample[..., :self.vae_size_split]
-        sample_appear = sample[..., self.vae_size_split:]
-        logits_shape_crop = self.dec_shape(sample_shape)
-        shape_crop = torch.sigmoid(logits_shape_crop)
-        unbiased_appear_crop = self.dec_appear(sample_appear)
-        appear_crop = restore_image(unbiased_appear_crop)
-        return shape_crop, appear_crop, mu, logvar
+    def encode(self, x, zeta):
+        what_mu_0, what_logvar_0 = self.enc_0(x).chunk(2, dim=-1)
+        what_mu_1, what_logvar_1 = self.enc_1(x).chunk(2, dim=-1)
+        what_mu = zeta * what_mu_1 + (1 - zeta) * what_mu_0
+        what_logvar = zeta * what_logvar_1 + (1 - zeta) * what_logvar_0
+        return what_mu, what_logvar
 
+    def decode(self, what_mu, what_logvar, grid_full):
+        sample = reparameterize_normal(what_mu, what_logvar)
+        apc_crop_color = self.dec_apc_color(sample)[..., None, None]
+        apc_crop_diff = self.dec_apc_diff(sample)
+        apc_crop = restore_image(apc_crop_color + apc_crop_diff)
+        logits_shp_crop = self.dec_shp(sample)
+        shp_crop = torch.sigmoid(logits_shp_crop)
+        apc = nn.functional.grid_sample(apc_crop, grid_full)
+        shp = nn.functional.grid_sample(shp_crop, grid_full)
+        return apc, shp, apc_crop, apc_crop_diff, shp_crop
 
-class VAEBack(nn.Module):
-
-    def __init__(self, args):
-        super(VAEBack, self).__init__()
-        vae_size = args.vae_size_back
-        # Encoder
-        self.enc = VAEEncoder(
-            num_features_in=args.state_size_back,
-            config_hidden=args.enc_back_hidden,
-            vae_size=vae_size,
-            vae_groups=2,
-        )
-        # Decoder
-        self.dec = VAEDecoderSimple(
-            num_planes_out=args.image_channels,
-            plane_size_out=args.image_full_size,
-            config_hidden=args.dec_back_hidden,
-            vae_size=vae_size,
-        )
-
-    def forward(self, x):
-        mu, logvar = self.enc(x)
-        sample = reparameterize_normal(mu, logvar)
-        unbiased_back = self.dec(sample)
-        back = restore_image(unbiased_back)
-        return back, mu, logvar
+    def forward(self, x, zeta, grid_full):
+        what_mu, what_logvar = self.encode(x, zeta)
+        apc, shp, apc_crop, apc_crop_diff, shp_crop = self.decode(what_mu, what_logvar, grid_full)
+        result = {
+            'apc': apc, 'shp': shp, 'apc_crop': apc_crop, 'apc_crop_diff': apc_crop_diff, 'shp_crop': shp_crop,
+            'what_mu': what_mu, 'what_logvar': what_logvar,
+        }
+        return result
