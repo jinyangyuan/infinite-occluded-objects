@@ -1,15 +1,7 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional
-from building_block import FC, EncoderConv, DecoderConv
-
-
-def normalize_image(x):
-    return x * 2 - 1
-
-
-def restore_image(x):
-    return (x + 1) * 0.5
+import torch.nn.functional as nn_func
+from building_block import LinearBlock, EncoderBlock, DecoderBlock
 
 
 def reparameterize_normal(mu, logvar):
@@ -18,304 +10,262 @@ def reparameterize_normal(mu, logvar):
     return mu + std * noise
 
 
-class UpdaterBase(nn.Module):
+class NetworkStates(nn.Module):
 
-    def __init__(self, channel_list, kernel_list, stride_list, hidden_list, num_planes_in, plane_height_in,
-                 plane_width_in, num_features_out, state_size):
-        super(UpdaterBase, self).__init__()
-        self.net = EncoderConv(
+    def __init__(self, channel_list, kernel_list, stride_list, hidden_list, in_shape, state_size):
+        super(NetworkStates, self).__init__()
+        self.enc = EncoderBlock(
             channel_list=channel_list,
             kernel_list=kernel_list,
             stride_list=stride_list,
             hidden_list=hidden_list,
-            num_planes_in=num_planes_in,
-            plane_height_in=plane_height_in,
-            plane_width_in=plane_width_in,
-            num_features_out=num_features_out,
-            last_activation=True,
+            in_shape=in_shape,
+            out_features=None,
         )
-        self.lstm = nn.LSTMCell(num_features_out, state_size)
+        self.lstm = nn.LSTMCell(self.enc.out_features, state_size)
 
     def forward(self, inputs, states=None):
-        x = normalize_image(inputs)
-        x = self.net(x)
+        x = inputs * 2 - 1
+        x = self.enc(x)
         states = self.lstm(x, states)
         return states
 
 
-class InitializerBack(UpdaterBase):
+class InitializerBack(NetworkStates):
 
-    def __init__(self, args):
+    def __init__(self, config):
         super(InitializerBack, self).__init__(
-            channel_list=args.init_back_channel_list,
-            kernel_list=args.init_back_kernel_list,
-            stride_list=args.init_back_stride_list,
-            hidden_list=args.init_back_hidden_list,
-            num_planes_in=args.image_planes,
-            plane_height_in=args.image_full_height,
-            plane_width_in=args.image_full_width,
-            num_features_out=args.init_back_size,
-            state_size=args.state_back_size,
+            channel_list=config['init_back_channel'],
+            kernel_list=config['init_back_kernel'],
+            stride_list=config['init_back_stride'],
+            hidden_list=config['init_back_hidden'],
+            in_shape=config['image_shape'],
+            state_size=config['state_back_size'],
         )
 
 
 class InitializerFull(nn.Module):
 
-    def __init__(self, args):
+    def __init__(self, config):
         super(InitializerFull, self).__init__()
-        self.upd_main = UpdaterBase(
-            channel_list=args.init_full_channel_list,
-            kernel_list=args.init_full_kernel_list,
-            stride_list=args.init_full_stride_list,
-            hidden_list=args.init_full_main_hidden_list,
-            num_planes_in=args.image_planes * 2 + 1,
-            plane_height_in=args.image_full_height,
-            plane_width_in=args.image_full_width,
-            num_features_out=args.init_full_main_size,
-            state_size=args.state_main_size,
+        self.upd = NetworkStates(
+            channel_list=config['init_main_channel'],
+            kernel_list=config['init_main_kernel'],
+            stride_list=config['init_main_stride'],
+            hidden_list=config['init_main_hidden'],
+            in_shape=[config['image_shape'][0] * 2 + 1, *config['image_shape'][1:]],
+            state_size=config['init_main_state'],
         )
-        self.net_full = FC(
-            hidden_list=args.init_full_full_hidden_list,
-            num_features_in=args.state_main_size,
-            num_features_out=args.init_full_full_size,
-            last_activation=True,
+        self.enc = LinearBlock(
+            hidden_list=config['init_full_hidden'],
+            in_features=config['init_main_state'],
+            out_features=None,
         )
-        self.lstm_full = nn.LSTMCell(args.init_full_full_size, args.state_full_size)
+        self.lstm = nn.LSTMCell(self.enc.out_features, config['state_full_size'])
 
     def forward(self, inputs, states_main):
-        states_main = self.upd_main(inputs, states_main)
-        x = self.net_full(states_main[0])
-        states_full = self.lstm_full(x)
+        states_main = self.upd(inputs, states_main)
+        x = self.enc(states_main[0])
+        states_full = self.lstm(x)
         return states_full, states_main
 
 
-class InitializerCrop(UpdaterBase):
+class InitializerCrop(NetworkStates):
 
-    def __init__(self, args):
+    def __init__(self, config):
         super(InitializerCrop, self).__init__(
-            channel_list=args.init_crop_channel_list,
-            kernel_list=args.init_crop_kernel_list,
-            stride_list=args.init_crop_stride_list,
-            hidden_list=args.init_crop_hidden_list,
-            num_planes_in=args.image_planes * 2 + 1,
-            plane_height_in=args.image_crop_height,
-            plane_width_in=args.image_crop_width,
-            num_features_out=args.init_crop_size,
-            state_size=args.state_crop_size,
+            channel_list=config['init_crop_channel'],
+            kernel_list=config['init_crop_kernel'],
+            stride_list=config['init_crop_stride'],
+            hidden_list=config['init_crop_hidden'],
+            in_shape=[config['crop_shape'][0] * 2 + 1, *config['crop_shape'][1:]],
+            state_size=config['state_crop_size'],
         )
 
 
-class UpdaterBack(UpdaterBase):
+class UpdaterBack(NetworkStates):
 
-    def __init__(self, args):
+    def __init__(self, config):
         super(UpdaterBack, self).__init__(
-            channel_list=args.upd_back_channel_list,
-            kernel_list=args.upd_back_kernel_list,
-            stride_list=args.upd_back_stride_list,
-            hidden_list=args.upd_back_hidden_list,
-            num_planes_in=args.image_planes * 3 + 1,
-            plane_height_in=args.image_full_height,
-            plane_width_in=args.image_full_width,
-            num_features_out=args.upd_back_size,
-            state_size=args.state_back_size,
+            channel_list=config['upd_back_channel'],
+            kernel_list=config['upd_back_kernel'],
+            stride_list=config['upd_back_stride'],
+            hidden_list=config['upd_back_hidden'],
+            in_shape=[config['image_shape'][0] * 3 + 1, *config['image_shape'][1:]],
+            state_size=config['state_back_size'],
         )
 
 
-class UpdaterFull(UpdaterBase):
+class UpdaterFull(NetworkStates):
 
-    def __init__(self, args):
+    def __init__(self, config):
         super(UpdaterFull, self).__init__(
-            channel_list=args.upd_full_channel_list,
-            kernel_list=args.upd_full_kernel_list,
-            stride_list=args.upd_full_stride_list,
-            hidden_list=args.upd_full_hidden_list,
-            num_planes_in=args.image_planes * 4 + 2,
-            plane_height_in=args.image_full_height,
-            plane_width_in=args.image_full_width,
-            num_features_out=args.upd_full_size,
-            state_size=args.state_full_size,
+            channel_list=config['upd_full_channel'],
+            kernel_list=config['upd_full_kernel'],
+            stride_list=config['upd_full_stride'],
+            hidden_list=config['upd_full_hidden'],
+            in_shape=[config['image_shape'][0] * 4 + 2, *config['image_shape'][1:]],
+            state_size=config['state_full_size'],
         )
 
 
-class UpdaterCrop(UpdaterBase):
+class UpdaterCrop(NetworkStates):
 
-    def __init__(self, args):
+    def __init__(self, config):
         super(UpdaterCrop, self).__init__(
-            channel_list=args.upd_crop_channel_list,
-            kernel_list=args.upd_crop_kernel_list,
-            stride_list=args.upd_crop_stride_list,
-            hidden_list=args.upd_crop_hidden_list,
-            num_planes_in=args.image_planes * 4 + 2,
-            plane_height_in=args.image_crop_height,
-            plane_width_in=args.image_crop_width,
-            num_features_out=args.upd_crop_size,
-            state_size=args.state_crop_size,
+            channel_list=config['upd_crop_channel'],
+            kernel_list=config['upd_crop_kernel'],
+            stride_list=config['upd_crop_stride'],
+            hidden_list=config['upd_crop_hidden'],
+            in_shape=[config['crop_shape'][0] * 4 + 2, *config['crop_shape'][1:]],
+            state_size=config['state_crop_size'],
         )
 
 
-class EncDecBack(nn.Module):
+class DecoderApc(nn.Module):
 
-    def __init__(self, args):
-        super(EncDecBack, self).__init__()
-        self.enc = FC(
-            hidden_list=args.enc_back_hidden_list,
-            num_features_in=args.state_back_size,
-            num_features_out=args.latent_back_size * 2,
-            last_activation=False,
+    def __init__(self, avg_hidden_list_rev, res_channel_list_rev, res_kernel_list_rev, res_stride_list_rev,
+                 res_hidden_list_rev, in_features, image_shape):
+        super(DecoderApc, self).__init__()
+        self.dec_avg = LinearBlock(
+            hidden_list=reversed(avg_hidden_list_rev),
+            in_features=in_features,
+            out_features=image_shape[0],
         )
-        self.dec_color = FC(
-            hidden_list=args.dec_back_color_hidden_list,
-            num_features_in=args.latent_back_size,
-            num_features_out=args.image_planes,
-            last_activation=False,
+        self.dec_res = DecoderBlock(
+            channel_list_rev=res_channel_list_rev,
+            kernel_list_rev=res_kernel_list_rev,
+            stride_list_rev=res_stride_list_rev,
+            hidden_list_rev=res_hidden_list_rev,
+            in_features=in_features,
+            out_shape=image_shape,
         )
-        self.dec_diff = DecoderConv(
-            channel_list_rev=args.dec_back_diff_channel_list_rev,
-            kernel_list_rev=args.dec_back_diff_kernel_list_rev,
-            stride_list_rev=args.dec_back_diff_stride_list_rev,
-            hidden_list_rev=args.dec_back_diff_hidden_list_rev,
-            num_features_in=args.latent_back_size,
-            num_planes_out=args.image_planes,
-            plane_height_out=args.image_full_height,
-            plane_width_out=args.image_full_width,
+
+    def forward(self, x):
+        apc_avg = self.dec_avg(x)[..., None, None]
+        apc_res = self.dec_res(x)
+        apc = (apc_avg + apc_res + 1) * 0.5
+        return apc, apc_res
+
+
+class NetworkBack(nn.Module):
+
+    def __init__(self, config):
+        super(NetworkBack, self).__init__()
+        self.enc = LinearBlock(
+            hidden_list=config['enc_bck_hidden'],
+            in_features=config['state_back_size'],
+            out_features=config['latent_bck_size'] * 2,
+        )
+        self.dec = DecoderApc(
+            avg_hidden_list_rev=config['dec_bck_avg_hidden_rev'],
+            res_channel_list_rev=config['dec_bck_res_channel_rev'],
+            res_kernel_list_rev=config['dec_bck_res_kernel_rev'],
+            res_stride_list_rev=config['dec_bck_res_stride_rev'],
+            res_hidden_list_rev=config['dec_bck_res_hidden_rev'],
+            in_features=config['latent_bck_size'],
+            image_shape=config['image_shape'],
         )
 
     def encode(self, x):
-        back_mu, back_logvar = self.enc(x).chunk(2, dim=-1)
-        return back_mu, back_logvar
+        mu, logvar = self.enc(x).chunk(2, dim=-1)
+        return mu, logvar
 
-    def decode(self, back_mu, back_logvar):
-        sample = reparameterize_normal(back_mu, back_logvar)
-        back_color = self.dec_color(sample)[..., None, None]
-        back_diff = self.dec_diff(sample)
-        back = restore_image(back_color + back_diff)
-        return back, back_diff
+    def decode(self, mu, logvar):
+        sample = reparameterize_normal(mu, logvar)
+        bck, bck_res = self.dec(sample)
+        return bck, bck_res
 
     def forward(self, x):
-        back_mu, back_logvar = self.encode(x)
-        back, back_diff = self.decode(back_mu, back_logvar)
-        result = {'back': back, 'back_diff': back_diff, 'back_mu': back_mu, 'back_logvar': back_logvar}
+        mu, logvar = self.encode(x)
+        bck, bck_res = self.decode(mu, logvar)
+        result = {'bck': bck, 'bck_res': bck_res, 'bck_mu': mu, 'bck_logvar': logvar}
         return result
 
 
-class EncDecFull(nn.Module):
+class NetworkFull(nn.Module):
 
-    def __init__(self, args):
-        super(EncDecFull, self).__init__()
-        self.enc_pres = FC(
-            hidden_list=args.enc_pres_hidden_list,
-            num_features_in=args.state_full_size,
-            num_features_out=3,
-            last_activation=False,
-        )
-        self.enc_where_0 = FC(
-            hidden_list=args.enc_where_hidden_list,
-            num_features_in=args.state_full_size,
-            num_features_out=8,
-            last_activation=False,
-        )
-        self.enc_where_1 = FC(
-            hidden_list=args.enc_where_hidden_list,
-            num_features_in=args.state_full_size,
-            num_features_out=8,
-            last_activation=False,
+    def __init__(self, config):
+        super(NetworkFull, self).__init__()
+        self.enc = LinearBlock(
+            hidden_list=config['enc_stn_hidden'],
+            in_features=config['state_full_size'],
+            out_features=8,
         )
 
     def encode(self, x):
-        logits_tau1, logits_tau2, logits_zeta = self.enc_pres(x).chunk(3, dim=-1)
-        tau1 = nn.functional.softplus(logits_tau1)
-        tau2 = nn.functional.softplus(logits_tau2)
-        zeta = torch.sigmoid(logits_zeta)
-        where_mu_0, where_logvar_0 = self.enc_where_0(x).chunk(2, dim=-1)
-        where_mu_1, where_logvar_1 = self.enc_where_1(x).chunk(2, dim=-1)
-        where_mu = zeta * where_mu_1 + (1 - zeta) * where_mu_0
-        where_logvar = zeta * where_logvar_1 + (1 - zeta) * where_logvar_0
-        return tau1, tau2, zeta, logits_zeta, where_mu, where_logvar
+        mu, logvar = self.enc(x).chunk(2, dim=-1)
+        return mu, logvar
 
     @staticmethod
-    def decode(where_mu, where_logvar):
-        sample = reparameterize_normal(where_mu, where_logvar)
+    def decode(mu, logvar):
+        sample = reparameterize_normal(mu, logvar)
         scl = torch.sigmoid(sample[..., :2])
         trs = torch.tanh(sample[..., 2:])
         return scl, trs
 
     def forward(self, x):
-        tau1, tau2, zeta, logits_zeta, where_mu, where_logvar = self.encode(x)
-        scl, trs = self.decode(where_mu, where_logvar)
-        result = {
-            'scl': scl, 'trs': trs,
-            'tau1': tau1, 'tau2': tau2, 'zeta': zeta, 'logits_zeta': logits_zeta,
-            'where_mu': where_mu, 'where_logvar': where_logvar,
-        }
+        mu, logvar = self.encode(x)
+        scl, trs = self.decode(mu, logvar)
+        result = {'scl': scl, 'trs': trs, 'stn_mu': mu, 'stn_logvar': logvar}
         return result
 
 
-class EncDecCrop(nn.Module):
+class NetworkCrop(nn.Module):
 
-    def __init__(self, args):
-        super(EncDecCrop, self).__init__()
-        self.enc_0 = FC(
-            hidden_list=args.enc_what_hidden_list,
-            num_features_in=args.state_crop_size,
-            num_features_out=args.latent_what_size * 2,
-            last_activation=False,
+    def __init__(self, config):
+        super(NetworkCrop, self).__init__()
+        self.enc_pres = LinearBlock(
+            hidden_list=config['enc_pres_hidden'],
+            in_features=config['state_full_size'] + config['state_crop_size'],
+            out_features=3,
         )
-        self.enc_1 = FC(
-            hidden_list=args.enc_what_hidden_list,
-            num_features_in=args.state_crop_size,
-            num_features_out=args.latent_what_size * 2,
-            last_activation=False,
+        self.enc_obj = LinearBlock(
+            hidden_list=config['enc_obj_hidden'],
+            in_features=config['state_crop_size'],
+            out_features=config['latent_obj_size'] * 2,
         )
-        self.dec_apc_color = FC(
-            hidden_list=args.dec_apc_color_hidden_list,
-            num_features_in=args.latent_what_size,
-            num_features_out=args.image_planes,
-            last_activation=False,
+        self.dec_apc = DecoderApc(
+            avg_hidden_list_rev=config['dec_apc_avg_hidden_rev'],
+            res_channel_list_rev=config['dec_apc_res_channel_rev'],
+            res_kernel_list_rev=config['dec_apc_res_kernel_rev'],
+            res_stride_list_rev=config['dec_apc_res_stride_rev'],
+            res_hidden_list_rev=config['dec_apc_res_hidden_rev'],
+            in_features=config['latent_obj_size'],
+            image_shape=config['crop_shape'],
         )
-        self.dec_apc_diff = DecoderConv(
-            channel_list_rev=args.dec_apc_diff_channel_list_rev,
-            kernel_list_rev=args.dec_apc_diff_kernel_list_rev,
-            stride_list_rev=args.dec_apc_diff_stride_list_rev,
-            hidden_list_rev=args.dec_apc_diff_hidden_list_rev,
-            num_features_in=args.latent_what_size,
-            num_planes_out=args.image_planes,
-            plane_height_out=args.image_crop_height,
-            plane_width_out=args.image_crop_width,
-        )
-        self.dec_shp = DecoderConv(
-            channel_list_rev=args.dec_shp_channel_list_rev,
-            kernel_list_rev=args.dec_shp_kernel_list_rev,
-            stride_list_rev=args.dec_shp_stride_list_rev,
-            hidden_list_rev=args.dec_shp_hidden_list_rev,
-            num_features_in=args.latent_what_size,
-            num_planes_out=1,
-            plane_height_out=args.image_crop_height,
-            plane_width_out=args.image_crop_width,
+        self.dec_shp = DecoderBlock(
+            channel_list_rev=config['dec_shp_channel_rev'],
+            kernel_list_rev=config['dec_shp_kernel_rev'],
+            stride_list_rev=config['dec_shp_stride_rev'],
+            hidden_list_rev=config['dec_shp_hidden_rev'],
+            in_features=config['latent_obj_size'],
+            out_shape=[1, *config['crop_shape'][1:]],
         )
 
-    def encode(self, x, zeta):
-        what_mu_0, what_logvar_0 = self.enc_0(x).chunk(2, dim=-1)
-        what_mu_1, what_logvar_1 = self.enc_1(x).chunk(2, dim=-1)
-        what_mu = zeta * what_mu_1 + (1 - zeta) * what_mu_0
-        what_logvar = zeta * what_logvar_1 + (1 - zeta) * what_logvar_0
-        return what_mu, what_logvar
+    def encode(self, x_full, x_crop):
+        x_both = torch.cat([x_full, x_crop], dim=-1)
+        logits_tau1, logits_tau2, logits_zeta = self.enc_pres(x_both).chunk(3, dim=-1)
+        tau1 = nn_func.softplus(logits_tau1)
+        tau2 = nn_func.softplus(logits_tau2)
+        zeta = torch.sigmoid(logits_zeta)
+        mu, logvar = self.enc_obj(x_crop).chunk(2, dim=-1)
+        return tau1, tau2, zeta, logits_zeta, mu, logvar
 
-    def decode(self, what_mu, what_logvar, grid_full):
-        sample = reparameterize_normal(what_mu, what_logvar)
-        apc_crop_color = self.dec_apc_color(sample)[..., None, None]
-        apc_crop_diff = self.dec_apc_diff(sample)
-        apc_crop = restore_image(apc_crop_color + apc_crop_diff)
+    def decode(self, mu, logvar, grid_full):
+        sample = reparameterize_normal(mu, logvar)
+        apc_crop, apc_crop_res = self.dec_apc(sample)
         logits_shp_crop = self.dec_shp(sample)
         shp_crop = torch.sigmoid(logits_shp_crop)
-        apc = nn.functional.grid_sample(apc_crop, grid_full)
-        shp = nn.functional.grid_sample(shp_crop, grid_full)
-        return apc, shp, apc_crop, apc_crop_diff, shp_crop
+        apc = nn_func.grid_sample(apc_crop, grid_full, align_corners=False)
+        shp = nn_func.grid_sample(shp_crop, grid_full, align_corners=False)
+        return apc, shp, apc_crop, apc_crop_res, shp_crop
 
-    def forward(self, x, zeta, grid_full):
-        what_mu, what_logvar = self.encode(x, zeta)
-        apc, shp, apc_crop, apc_crop_diff, shp_crop = self.decode(what_mu, what_logvar, grid_full)
+    def forward(self, x_full, x_crop, grid_full):
+        tau1, tau2, zeta, logits_zeta, mu, logvar = self.encode(x_full, x_crop)
+        apc, shp, apc_crop, apc_crop_res, shp_crop = self.decode(mu, logvar, grid_full)
         result = {
-            'apc': apc, 'shp': shp, 'apc_crop': apc_crop, 'apc_crop_diff': apc_crop_diff, 'shp_crop': shp_crop,
-            'what_mu': what_mu, 'what_logvar': what_logvar,
+            'apc': apc, 'shp': shp, 'apc_crop': apc_crop, 'apc_crop_res': apc_crop_res, 'shp_crop': shp_crop,
+            'tau1': tau1, 'tau2': tau2, 'zeta': zeta, 'logits_zeta': logits_zeta, 'obj_mu': mu, 'obj_logvar': logvar,
         }
         return result

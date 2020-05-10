@@ -53,54 +53,32 @@ def generate_images(objects):
     for idx in range(1, objects.shape[1]):
         masks = objects[:, idx, -1:]
         images = images * (1 - masks) + objects[:, idx, :-1] * masks
+    images = (images * 255).astype(np.uint8)
     return images
 
 
-def generate_labels_mask(objects, th=0.5):
+def generate_labels(objects, th=0.5):
     masks_rev = objects[:, ::-1, -1]
     part_cumprod = np.concatenate([
         np.ones((masks_rev.shape[0], 1, *masks_rev.shape[2:]), dtype=masks_rev.dtype),
         np.cumprod(1 - masks_rev[:, :-1], 1),
     ], axis=1)
     coef = (masks_rev * part_cumprod)[:, ::-1]
-    values = np.argmax(coef, 1).astype(np.int32)
-    counts = (masks_rev >= th).sum(1) - 1
-    valids = (counts == 1).astype(values.dtype)
-    labels = np.stack([values, valids], axis=1)
-    return labels
-
-
-def generate_labels_rgba(objects):
-    labels = objects.copy()
-    masks = labels[:, 1:, -1:]
-    labels[:, 1:, :-1] = labels[:, 1:, :-1] * masks + labels[:, :1, :-1] * (1 - masks)
+    segments = np.argmax(coef, 1).astype(np.uint8)
+    overlaps = ((masks_rev >= th).sum(1) - 1).astype(np.uint8)
+    labels = {'segment': segments, 'overlap': overlaps}
     return labels
 
 
 def create_dataset(name, objects):
     images = {key: generate_images(val) for key, val in objects.items()}
-    labels_mask = {key: generate_labels_mask(val) for key, val in objects.items()}
-    labels_rgba = {key: generate_labels_rgba(val) for key, val in objects.items()}
-    with h5py.File('{}_data.h5'.format(name), 'w') as f:
-        for key, val in images.items():
-            f.create_dataset(key, data=val, compression='gzip', chunks=True)
-    with h5py.File('{}_labels.h5'.format(name), 'w') as f:
-        f.create_group('mask')
-        for key, val in labels_mask.items():
-            f['mask'].create_dataset(key, data=val, compression='gzip', chunks=True)
-        f.create_group('rgba')
-        for key, val in labels_rgba.items():
-            f['rgba'].create_dataset(key, data=val, compression='gzip', chunks=True)
+    labels = {key: generate_labels(val) for key, val in objects.items()}
+    objects = {key: (val * 255).astype(np.uint8) for key, val in objects.items()}
+    with h5py.File('{}.h5'.format(name), 'w') as f:
+        for key in images:
+            f.create_group(key)
+            f[key].create_dataset('image', data=images[key], compression='gzip')
+            f[key].create_dataset('segment', data=labels[key]['segment'], compression='gzip')
+            f[key].create_dataset('overlap', data=labels[key]['overlap'], compression='gzip')
+            f[key].create_dataset('layers', data=objects[key], compression='gzip')
     return
-
-
-def load_objects(folder, name):
-    with h5py.File(os.path.join(folder, '{}_labels.h5'.format(name)), 'r') as f:
-        labels_rgba = {key: f['rgba'][key][()] for key in f['rgba']}
-    objects = {}
-    for key, val in labels_rgba.items():
-        masks = val[:, 1:, -1:].repeat(val.shape[2] - 1, axis=2)
-        pos_sel = masks != 0
-        val[:, 1:, :-1][pos_sel] = (val[:, 1:, :-1] - val[:, :1, :-1] * (1 - masks))[pos_sel] / masks[pos_sel]
-        objects[key] = val
-    return objects

@@ -1,106 +1,94 @@
-path_data: null
-folder: null
-train: null
+summ_scalar_intvl: 1
+summ_image_intvl: 1
+summ_image_count: 10
 
-gaussian_std: 0.3
+normal_scale: 0.3
 lr: 1.0e-4
-max_objects: 4
 batch_size: 128
 num_workers: 1
 num_epochs: 100
-num_steps: 2
 num_tests: 5
+num_slots: 5
+num_steps: 2
+step_wt: null
 
-coef_param_dict:
-    recon:
-        epochs: [50]
-        values: [1.0, 1.0, 0.0]
-        linears: [1, 1]
-    back_prior:
-        epochs: [50]
-        values: [1.0, 0.0, 0.0]
-        linears: [1, 1]
-    back_diff:
-        epochs: []
-        values: [1.0, 1.0]
-        linears: [1]
-    apc_diff:
-        epochs: []
-        values: [1.0, 1.0]
-        linears: [1]
+loss_coef:
+  recon:
+    epoch: [50]
+    value: [1.0, 1.0, 0.0]
+    linear: [true, true]
+  bck_prior:
+    epoch: [50]
+    value: [1.0, 0.0, 0.0]
+    linear: [true, true]
+  bck_var:
+    epoch: []
+    value: [1.0, 1.0]
+    linear: [true]
+  apc_var:
+    epoch: []
+    value: [1.0, 1.0]
+    linear: [true]
 
-state_main_size: 256
 state_back_size: 256
 state_full_size: 256
 state_crop_size: 256
 
-init_back_channel_list: [8, 8, 16, 16]
-init_back_kernel_list: [3, 3, 3, 3]
-init_back_stride_list: [1, 2, 1, 2]
-init_back_hidden_list: []
-init_back_size: 256
+init_back_channel: [8, 8, 16, 16]
+init_back_kernel: [3, 3, 3, 3]
+init_back_stride: [1, 2, 1, 2]
+init_back_hidden: [256]
 
-init_full_channel_list: [8, 8, 16, 16]
-init_full_kernel_list: [3, 3, 3, 3]
-init_full_stride_list: [1, 2, 1, 2]
-init_full_main_hidden_list: []
-init_full_main_size: 256
-init_full_full_hidden_list: [256]
-init_full_full_size: 256
+init_main_channel: [16, 16, 32, 32]
+init_main_kernel: [3, 3, 3, 3]
+init_main_stride: [1, 2, 1, 2]
+init_main_hidden: [256]
+init_main_state: 256
+init_full_hidden: [256]
 
-init_crop_channel_list: [8, 8, 16, 16]
-init_crop_kernel_list: [3, 3, 3, 3]
-init_crop_stride_list: [1, 2, 1, 2]
-init_crop_hidden_list: []
-init_crop_size: 256
+init_crop_channel: [16, 16, 32, 32]
+init_crop_kernel: [3, 3, 3, 3]
+init_crop_stride: [1, 2, 1, 2]
+init_crop_hidden: [256]
 
-upd_back_channel_list: [8, 8, 16, 16]
-upd_back_kernel_list: [3, 3, 3, 3]
-upd_back_stride_list: [1, 2, 1, 2]
-upd_back_hidden_list: []
-upd_back_size: 256
+upd_back_channel: [8, 8, 16, 16]
+upd_back_kernel: [3, 3, 3, 3]
+upd_back_stride: [1, 2, 1, 2]
+upd_back_hidden: [256]
 
-upd_full_channel_list: [8, 8, 16, 16]
-upd_full_kernel_list: [3, 3, 3, 3]
-upd_full_stride_list: [1, 2, 1, 2]
-upd_full_hidden_list: []
-upd_full_size: 256
+upd_full_channel: [16, 16, 32, 32]
+upd_full_kernel: [3, 3, 3, 3]
+upd_full_stride: [1, 2, 1, 2]
+upd_full_hidden: [256]
 
-upd_crop_channel_list: [8, 8, 16, 16]
-upd_crop_kernel_list: [3, 3, 3, 3]
-upd_crop_stride_list: [1, 2, 1, 2]
-upd_crop_hidden_list: []
-upd_crop_size: 256
+upd_crop_channel: [16, 16, 32, 32]
+upd_crop_kernel: [3, 3, 3, 3]
+upd_crop_stride: [1, 2, 1, 2]
+upd_crop_hidden: [256]
 
-latent_back_size: 32
-enc_back_hidden_list: [256]
-dec_back_color_hidden_list: [16, 16]
-dec_back_diff_channel_list_rev: [8, 8, 16, 16]
-dec_back_diff_kernel_list_rev: [3, 3, 3, 3]
-dec_back_diff_stride_list_rev: [1, 2, 1, 2]
-dec_back_diff_hidden_list_rev: [256]
+latent_bck_size: 32
+enc_bck_hidden: [256]
+dec_bck_avg_hidden_rev: [32, 32]
+dec_bck_res_channel_rev: []
+dec_bck_res_kernel_rev: []
+dec_bck_res_stride_rev: []
+dec_bck_res_hidden_rev: [512, 256]
 
 prior_pres_alpha: 1.0e-3
-enc_pres_hidden_list: [128, 64]
+enc_pres_hidden: [256, 256]
 
-prior_where_mu: [0.0, 0.0, 0.0, 0.0]
-prior_where_std: [0.5, 0.5, 0.5, 0.5]
-enc_where_hidden_list: [256, 256]
+prior_stn_mu: [0.0, 0.0, 0.0, 0.0]
+prior_stn_std: [0.2, 0.2, 0.5, 0.5]
+enc_stn_hidden: [256, 256]
 
-latent_what_size: 64
-enc_what_hidden_list: [256]
-dec_apc_color_hidden_list: [16, 16]
-dec_apc_diff_channel_list_rev: [8, 8, 16, 16]
-dec_apc_diff_kernel_list_rev: [3, 3, 3, 3]
-dec_apc_diff_stride_list_rev: [1, 2, 1, 2]
-dec_apc_diff_hidden_list_rev: [256]
-dec_shp_channel_list_rev: [8, 8, 16, 16]
-dec_shp_kernel_list_rev: [3, 3, 3, 3]
-dec_shp_stride_list_rev: [1, 2, 1, 2]
-dec_shp_hidden_list_rev: [256]
-
-file_args: args.yaml
-file_log: train.log
-file_model: model.pth
-file_result_base: result_{}.h5
-loss_weights: null
+latent_obj_size: 64
+enc_obj_hidden: [256]
+dec_apc_avg_hidden_rev: [64, 64]
+dec_apc_res_channel_rev: []
+dec_apc_res_kernel_rev: []
+dec_apc_res_stride_rev: []
+dec_apc_res_hidden_rev: [512, 256]
+dec_shp_channel_rev: []
+dec_shp_kernel_rev: []
+dec_shp_stride_rev: []
+dec_shp_hidden_rev: [512, 256]

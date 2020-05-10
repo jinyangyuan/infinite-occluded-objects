@@ -1,7 +1,8 @@
 import argparse
+import h5py
 import numpy as np
 import os
-from common import load_objects, create_dataset
+from common import create_dataset
 
 
 def convert_color(x, color_divs):
@@ -54,7 +55,8 @@ if __name__ == '__main__':
     # Objects
     colors = [convert_color(idx, args.color_divs) for idx in range(pow(args.color_divs, 3))]
     colors_compatible = [compute_colors_compatible(color_ref, colors) for color_ref in colors]
-    objects_prev = load_objects(args.folder_inputs, args.name)
+    with h5py.File(os.path.join(args.folder_inputs, '{}.h5'.format(args.name)), 'r') as f:
+        objects_prev = {key: f[key]['layers'][()] / 255 for key in f}
     objects = {key: np.empty((*val.shape[:2], colors[0].shape[0] + 1, *val.shape[3:]), val.dtype)
                for key, val in objects_prev.items()}
     np.random.seed(args.seed)

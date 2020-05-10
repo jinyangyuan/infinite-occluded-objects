@@ -1,152 +1,155 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional
+import torch.nn.functional as nn_func
 
 
-def init_conv(modules):
-    for m in modules:
-        if isinstance(m, nn.Conv2d):
-            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 1e-2)
+def get_linear_ln(in_features, out_features, activation=None):
+    layers = [nn.Linear(in_features, out_features)]
+    nonlinearity='linear'
+    if activation is not None:
+        layers += [
+            nn.LayerNorm(out_features),
+            activation(inplace=True),
+        ]
+        nonlinearity='relu'
+    nn.init.kaiming_normal_(layers[0].weight, mode='fan_in', nonlinearity=nonlinearity)
+    nn.init.zeros_(layers[0].bias)
+    return layers
+
+
+def get_enc_conv_ln(in_channels, out_channels, kernel_size, stride, activation=None):
+    pad_1 = (kernel_size - 1) // 2
+    pad_2 = kernel_size - 1 - pad_1
+    layers = [
+        nn.ZeroPad2d((pad_1, pad_2, pad_1, pad_2)),
+        nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride),
+    ]
+    nonlinearity = 'linear'
+    if activation is not None:
+        layers += [
+            LayerNormConv(out_channels),
+            activation(inplace=True),
+        ]
+        nonlinearity = 'relu'
+    nn.init.kaiming_normal_(layers[1].weight, mode='fan_in', nonlinearity=nonlinearity)
+    nn.init.zeros_(layers[1].bias)
+    return layers
+
+
+def get_dec_conv_ln(in_channels, out_channels, kernel_size, in_size, out_size, activation=None):
+    layers = []
+    if in_size != out_size:
+        layers.append(Interpolate(out_size))
+    layers += get_enc_conv_ln(in_channels, out_channels, kernel_size, stride=1, activation=activation)
+    return layers
 
 
 class LayerNormConv(nn.Module):
 
-    def __init__(self, num_planes):
+    def __init__(self, num_channels):
         super(LayerNormConv, self).__init__()
-        self.weight = nn.Parameter(torch.ones(num_planes, 1, 1))
-        self.bias = nn.Parameter(torch.zeros(num_planes, 1, 1))
+        self.weight = nn.Parameter(torch.ones(num_channels, 1, 1), requires_grad=True)
+        self.bias = nn.Parameter(torch.zeros(num_channels, 1, 1), requires_grad=True)
 
     def forward(self, x):
         weight = self.weight.expand(-1, *x.shape[-2:])
         bias = self.bias.expand(-1, *x.shape[-2:])
-        return nn.functional.layer_norm(x, x.shape[-3:], weight, bias)
+        return nn_func.layer_norm(x, x.shape[-3:], weight, bias)
 
 
-class Upsample(nn.Module):
+class Interpolate(nn.Module):
 
-    def __init__(self, scale_factor):
-        super(Upsample, self).__init__()
-        self.scale_factor = scale_factor
+    def __init__(self, size):
+        super(Interpolate, self).__init__()
+        self.size = size
 
     def forward(self, x):
-        return nn.functional.interpolate(x, scale_factor=self.scale_factor)
+        return nn_func.interpolate(x, size=self.size)
 
 
-class FC(nn.Module):
+class LinearBlock(nn.Sequential):
 
-    def __init__(self, hidden_list, num_features_in, num_features_out, last_activation):
-        super(FC, self).__init__()
+    def __init__(self, hidden_list, in_features, out_features, activation: nn.Module=nn.ReLU):
         layers = []
         for num_features in hidden_list:
-            layers = layers + self.create_layers(num_features_in, num_features)
-            num_features_in = num_features
-        layers = layers + self.create_layers(num_features_in, num_features_out, last_activation)
-        self.net = nn.Sequential(*layers)
-
-    @staticmethod
-    def create_layers(num_features_in, num_features_out, use_activation=True):
-        layers = [nn.Linear(num_features_in, num_features_out)]
-        if use_activation:
-            layers += [
-                nn.LayerNorm(num_features_out),
-                nn.ReLU(inplace=True),
-            ]
-        return layers
-
-    def forward(self, x):
-        x = self.net(x)
-        return x
+            layers += get_linear_ln(in_features, num_features, activation=activation)
+            in_features = num_features
+        self.out_features = in_features
+        if out_features is not None:
+            layers += get_linear_ln(in_features, out_features)
+            self.out_features = out_features
+        super(LinearBlock, self).__init__(*layers)
 
 
-class EncoderConv(nn.Module):
+class EncoderBlock(nn.Module):
 
-    def __init__(self, channel_list, kernel_list, stride_list, hidden_list, num_planes_in, plane_height_in,
-                 plane_width_in, num_features_out, last_activation):
-        super(EncoderConv, self).__init__()
+    def __init__(self, channel_list, kernel_list, stride_list, hidden_list, in_shape, out_features,
+                 activation: nn.Module=nn.ReLU):
+        super(EncoderBlock, self).__init__()
         assert len(channel_list) == len(kernel_list)
         assert len(channel_list) == len(stride_list)
         layers = []
-        for num_planes_out, kernel_size, stride in zip(channel_list, kernel_list, stride_list):
-            assert plane_height_in % stride == 0
-            assert plane_width_in % stride == 0
-            layers = layers + self.create_layers(num_planes_in, num_planes_out, kernel_size, stride)
-            num_planes_in = num_planes_out
-            plane_height_in //= stride
-            plane_width_in //= stride
+        in_channels, in_height, in_width = in_shape
+        for num_channels, kernel_size, stride in zip(channel_list, kernel_list, stride_list):
+            layers += get_enc_conv_ln(in_channels, num_channels, kernel_size, stride, activation=activation)
+            in_channels = num_channels
+            in_height = (in_height - 1) // stride + 1
+            in_width = (in_width - 1) // stride + 1
         self.conv = nn.Sequential(*layers)
-        self.fc = FC(
+        self.linear = LinearBlock(
             hidden_list=hidden_list,
-            num_features_in=num_planes_in * plane_height_in * plane_width_in,
-            num_features_out=num_features_out,
-            last_activation=last_activation,
-        ).net
-        init_conv(self.modules())
-
-    @staticmethod
-    def create_layers(num_planes_in, num_planes_out, kernel_size, stride):
-        layers = [torch.nn.ZeroPad2d((0, 1, 0, 1))] if kernel_size % 2 == 0 else []
-        padding = (kernel_size - 1) // 2
-        layers += [
-            nn.Conv2d(num_planes_in, num_planes_out, kernel_size, stride=stride, padding=padding),
-            LayerNormConv(num_planes_out),
-            nn.ReLU(inplace=True),
-        ]
-        return layers
+            in_features=in_channels * in_height * in_width,
+            out_features=out_features,
+            activation=activation,
+        )
+        self.out_features = self.linear.out_features
 
     def forward(self, x):
         x = self.conv(x)
-        x = x.view(x.shape[0], -1)
-        x = self.fc(x)
+        x = x.reshape(x.shape[0], -1)
+        x = self.linear(x)
         return x
 
 
-class DecoderConv(nn.Module):
+class DecoderBlock(nn.Module):
 
-    def __init__(self, channel_list_rev, kernel_list_rev, stride_list_rev, hidden_list_rev, num_features_in,
-                 num_planes_out, plane_height_out, plane_width_out):
-        super(DecoderConv, self).__init__()
+    def __init__(self, channel_list_rev, kernel_list_rev, stride_list_rev, hidden_list_rev, in_features, out_shape,
+                 activation: nn.Module=nn.ReLU):
+        super(DecoderBlock, self).__init__()
         assert len(channel_list_rev) == len(kernel_list_rev)
         assert len(channel_list_rev) == len(stride_list_rev)
         layers = []
-        use_activation = False
-        for num_planes_in, kernel_size, stride in zip(channel_list_rev, kernel_list_rev, stride_list_rev):
-            assert plane_height_out % stride == 0
-            assert plane_width_out % stride == 0
-            layers = self.create_layers(num_planes_in, num_planes_out, kernel_size, stride, use_activation) + layers
-            num_planes_out = num_planes_in
-            plane_height_out //= stride
-            plane_width_out //= stride
-            use_activation = True
-        self.num_planes = num_planes_out
-        self.plane_height = plane_height_out
-        self.plane_width = plane_width_out
-        self.fc = FC(
-            hidden_list=reversed(hidden_list_rev),
-            num_features_in=num_features_in,
-            num_features_out=self.num_planes * self.plane_height * self.plane_width,
-            last_activation=True,
-        ).net
+        out_channels, out_height, out_width = out_shape
+        layer_act = None
+        for num_channels, kernel_size, stride in zip(channel_list_rev, kernel_list_rev, stride_list_rev):
+            in_height = (out_height - 1) // stride + 1
+            in_width = (out_width - 1) // stride + 1
+            sub_layers = get_dec_conv_ln(num_channels, out_channels, kernel_size, in_size=[in_height, in_width],
+                                         out_size=[out_height, out_width], activation=layer_act)
+            layers = sub_layers + layers
+            out_channels = num_channels
+            out_height = in_height
+            out_width = in_width
+            layer_act = activation
         self.conv = nn.Sequential(*layers)
-        init_conv(self.modules())
-
-    @staticmethod
-    def create_layers(num_planes_in, num_planes_out, kernel_size, stride, use_activation):
-        layers = [] if stride == 1 else [Upsample(stride)]
-        if kernel_size % 2 == 0:
-            layers.append(torch.nn.ZeroPad2d((0, 1, 0, 1)))
-        padding = (kernel_size - 1) // 2
-        layers.append(nn.Conv2d(num_planes_in, num_planes_out, kernel_size, padding=padding))
-        if use_activation:
-            layers += [
-                LayerNormConv(num_planes_out),
-                nn.ReLU(inplace=True),
-            ]
-        return layers
+        if layer_act is None:
+            self.linear = LinearBlock(
+                hidden_list=[*reversed(hidden_list_rev)],
+                in_features=in_features,
+                out_features=out_channels * out_height * out_width,
+                activation=activation,
+            )
+        else:
+            self.linear = LinearBlock(
+                hidden_list=[*reversed(hidden_list_rev)] + [out_channels * out_height * out_width],
+                in_features=in_features,
+                out_features=None,
+                activation=activation,
+            )
+        self.in_shape = [out_channels, out_height, out_width]
 
     def forward(self, x):
-        x = self.fc(x)
-        x = x.view(x.shape[0], self.num_planes, self.plane_height, self.plane_width)
+        x = self.linear(x)
+        x = x.reshape(x.shape[0], *self.in_shape)
         x = self.conv(x)
         return x
