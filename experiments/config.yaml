@@ -13,10 +13,10 @@ num_steps: 2
 step_wt: null
 
 loss_coef:
-  recon:
-    epoch: [50]
-    value: [1.0, 1.0, 0.0]
-    linear: [true, true]
+  temp:
+    epoch: []
+    value: [2.0, 0.5]
+    linear: [false]
   bck_prior:
     epoch: [50]
     value: [1.0, 0.0, 0.0]
@@ -74,7 +74,7 @@ dec_bck_res_kernel_rev: []
 dec_bck_res_stride_rev: []
 dec_bck_res_hidden_rev: [512, 256]
 
-prior_pres_alpha: 1.0e-3
+prior_pres_alpha: 2.5
 enc_pres_hidden: [256, 256]
 
 prior_stn_mu: [0.0, 0.0, 0.0, 0.0]

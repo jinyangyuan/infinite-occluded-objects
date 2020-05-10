@@ -34,7 +34,7 @@ class Model(nn.Module):
         self.net_full = NetworkFull(config)
         self.net_crop = NetworkCrop(config)
 
-    def forward(self, images, labels, step_wt):
+    def forward(self, images, labels, step_wt, temp=None, hard=True):
         ###################
         # Initializations #
         ###################
@@ -45,7 +45,7 @@ class Model(nn.Module):
         result_obj = {
             'apc': torch.zeros([0, *images.shape], device=images.device),
             'shp': torch.zeros([0, images.shape[0], 1, *images.shape[2:]], device=images.device),
-            'zeta': torch.zeros([0, images.shape[0], 1], device=images.device),
+            'pres': torch.zeros([0, images.shape[0], 1], device=images.device),
         }
         result_obj.update({
             key: None for key in
@@ -65,16 +65,15 @@ class Model(nn.Module):
             grid_crop, grid_full = self.compute_grid(result_full['scl'], result_full['trs'])
             init_crop_in = nn_func.grid_sample(init_full_in, grid_crop, align_corners=False)
             states_crop = self.init_crop(init_crop_in)
-            result_crop = self.net_crop(states_full[0], states_crop[0], grid_full)
+            result_crop = self.net_crop(states_full[0], states_crop[0], grid_full, temp, hard)
             # Update storage
             update_dict = {**result_full, **result_crop, 'states_full': states_full, 'states_crop': states_crop}
             self.initialize_storage(result_obj, states_dict, update_dict)
         # Adjust order
         self.adjust_order(images, result_obj, states_dict)
         # Losses
-        mask = self.compute_mask(result_obj['shp'], result_obj['zeta'])
         raw_pixel_ll = self.compute_raw_pixel_ll(images, result_bck['bck'], result_obj['apc'])
-        step_losses = self.compute_step_losses(images, result_bck, result_obj, mask, raw_pixel_ll)
+        step_losses = self.compute_step_losses(images, result_bck, result_obj, raw_pixel_ll)
         losses = {key: [val] for key, val in step_losses.items()}
         ###############
         # Refinements #
@@ -94,16 +93,15 @@ class Model(nn.Module):
                 grid_crop, grid_full = self.compute_grid(result_full['scl'], result_full['trs'])
                 upd_crop_in = self.compute_upd_crop_in(result_bck, result_obj, upd_full_in, grid_crop, idx_obj)
                 states_crop = self.upd_crop(upd_crop_in, states_dict['states_crop'][idx_obj])
-                result_crop = self.net_crop(states_full[0], states_crop[0], grid_full)
+                result_crop = self.net_crop(states_full[0], states_crop[0], grid_full, temp, hard)
                 # Update storage
                 update_dict = {**result_full, **result_crop, 'states_full': states_full, 'states_crop': states_crop}
                 self.update_storage(result_obj, states_dict, update_dict, idx_obj)
             # Adjust order
             self.adjust_order(images, result_obj, states_dict)
             # Losses
-            mask = self.compute_mask(result_obj['shp'], result_obj['zeta'])
             raw_pixel_ll = self.compute_raw_pixel_ll(images, result_bck['bck'], result_obj['apc'])
-            step_losses = self.compute_step_losses(images, result_bck, result_obj, mask, raw_pixel_ll)
+            step_losses = self.compute_step_losses(images, result_bck, result_obj, raw_pixel_ll)
             for key, val in step_losses.items():
                 losses[key].append(val)
         ###########
@@ -117,8 +115,9 @@ class Model(nn.Module):
         apc_all = torch.cat([result_obj['apc'], result_bck['bck'][None]]).transpose(0, 1)
         shp = result_obj['shp']
         shp_all = torch.cat([shp, torch.ones([1, *shp.shape[1:]], device=shp.device)]).transpose(0, 1)
-        pres = torch.bernoulli(result_obj['zeta'])
+        pres = torch.ge(result_obj['pres'], 0.5).type(torch.float)
         mask = self.compute_mask(shp, pres).transpose(0, 1)
+        log_mask = self.compute_log_mask(shp, pres).transpose(0, 1)
         pres = pres.squeeze(-1).transpose(0, 1)
         pres_all = torch.cat([pres, torch.ones([pres.shape[0], 1], device=images.device)], dim=1)
         recon = (mask * apc_all).sum(1)
@@ -134,8 +133,8 @@ class Model(nn.Module):
         results = {'apc': apc_all, 'shp': shp_all, 'pres': pres_all, 'scl': scl, 'trs': trs, 'recon': recon,
                    'mask': mask, 'segment_all': segment_all, 'segment_obj': segment_obj}
         # Metrics
-        metrics = self.compute_metrics(images, labels, pres, mask, mask_oh_all, mask_oh_obj, recon, raw_pixel_ll)
-        losses['compare'] = -metrics['ll'] + step_losses['kld']
+        metrics = self.compute_metrics(images, labels, pres, mask_oh_all, mask_oh_obj, recon, log_mask, raw_pixel_ll)
+        losses['compare'] = -metrics['ll'] + step_losses['kld_part']
         return results, metrics, losses
 
     def compute_grid(self, scl, trs):
@@ -154,13 +153,21 @@ class Model(nn.Module):
         return grid_crop, grid_full
 
     @staticmethod
-    def compute_mask(shp, zeta):
-        x = shp * zeta[..., None, None]
+    def compute_mask(shp, pres):
+        x = shp * pres[..., None, None]
         ones = torch.ones([1, *x.shape[1:]], device=x.device)
         return torch.cat([x, ones]) * torch.cat([ones, 1 - x]).cumprod(0)
 
+    @staticmethod
+    def compute_log_mask(shp, pres, eps=1e-5):
+        x = shp * pres[..., None, None]
+        log_x = torch.log(x + eps)
+        log1m_x = torch.log(1 - x + eps)
+        zeros = torch.zeros([1, *x.shape[1:]], device=x.device)
+        return torch.cat([log_x, zeros]) + torch.cat([zeros, log1m_x]).cumsum(0)
+
     def compute_init_full_in(self, images, result_bck, result_obj):
-        mask = self.compute_mask(result_obj['shp'], result_obj['zeta'])
+        mask = self.compute_mask(result_obj['shp'], result_obj['pres'])
         recon = (mask * torch.cat([result_obj['apc'], result_bck['bck'][None]])).sum(0)
         return torch.cat([images, recon, mask[-1]], dim=1).detach()
 
@@ -169,9 +176,9 @@ class Model(nn.Module):
         return torch.cat([inputs_excl, result_bck['bck']], dim=1).detach()
 
     def compute_upd_full_in(self, images, result_bck, result_obj, idx):
-        mask_above = self.compute_mask(result_obj['shp'][:idx], result_obj['zeta'][:idx])
-        mask_below = self.compute_mask(result_obj['shp'][idx + 1:], result_obj['zeta'][idx + 1:])
-        mask_cur = self.compute_mask(result_obj['shp'][idx:idx + 1], result_obj['zeta'][idx:idx + 1])
+        mask_above = self.compute_mask(result_obj['shp'][:idx], result_obj['pres'][:idx])
+        mask_below = self.compute_mask(result_obj['shp'][idx + 1:], result_obj['pres'][idx + 1:])
+        mask_cur = self.compute_mask(result_obj['shp'][idx:idx + 1], result_obj['pres'][idx:idx + 1])
         recon_above = (mask_above * torch.cat([result_obj['apc'][:idx], result_bck['bck'][None]])).sum(0)
         recon_below = (mask_below * torch.cat([result_obj['apc'][idx + 1:], result_bck['bck'][None]])).sum(0)
         recon_cur = (mask_cur * torch.cat([result_obj['apc'][idx:idx + 1], result_bck['bck'][None]])).sum(0)
@@ -181,7 +188,7 @@ class Model(nn.Module):
         excl_dims = self.image_shape[0] + 1
         inputs_excl = nn_func.grid_sample(upd_full_in[:, :-excl_dims], grid_crop, align_corners=False)
         bck_crop = nn_func.grid_sample(result_bck['bck'], grid_crop, align_corners=False)
-        mask_cur = self.compute_mask(result_obj['shp_crop'][idx:idx + 1], result_obj['zeta'][idx:idx + 1])
+        mask_cur = self.compute_mask(result_obj['shp_crop'][idx:idx + 1], result_obj['pres'][idx:idx + 1])
         recon_cur = (mask_cur * torch.cat([result_obj['apc_crop'][idx:idx + 1], bck_crop[None]])).sum(0)
         return torch.cat([inputs_excl, recon_cur, mask_cur[-1]], dim=1).detach()
 
@@ -214,7 +221,7 @@ class Model(nn.Module):
             return x
         sq_diffs = (result_obj['apc'] - images[None]).pow(2).sum(-3, keepdim=True).detach()
         visibles = result_obj['shp'].clone().detach()
-        zeta = result_obj['zeta'].detach()
+        pres = result_obj['pres'].detach()
         coefs = torch.ones(visibles.shape[:-2], device=visibles.device)
         indices_list = []
         for _ in range(self.obj_slots):
@@ -222,7 +229,7 @@ class Model(nn.Module):
             vis_areas = visibles.sum([-2, -1])
             vis_max_vals = visibles.reshape(*visibles.shape[:-2], -1).max(-1).values
             scores = torch.exp(-0.5 * self.normal_invvar * vis_sq_diffs / (vis_areas + eps))
-            scaled_scores = coefs * (vis_max_vals * zeta * scores + 1)
+            scaled_scores = coefs * (vis_max_vals * pres * scores + 1)
             indices = torch.argmax(scaled_scores, dim=0, keepdim=True)
             indices_list.append(indices)
             vis = torch.gather(visibles, 0, indices[..., None, None].expand(-1, -1, *visibles.shape[2:]))
@@ -242,13 +249,12 @@ class Model(nn.Module):
         raw_pixel_ll = -0.5 * (self.normal_const + self.normal_invvar * diff.pow(2)).sum(-3, keepdim=True)
         return raw_pixel_ll
 
-    def compute_kld(self, result_bck, result_obj):
+    def compute_kld_part(self, result_bck, result_obj):
         def compute_kld_normal(mu, logvar, prior_mu, prior_logvar, prior_invvar):
             return 0.5 * (prior_logvar - logvar + prior_invvar * ((mu - prior_mu).pow(2) + logvar.exp()) - 1)
         # Presence
         tau1 = result_obj['tau1']
         tau2 = result_obj['tau2']
-        zeta = result_obj['zeta']
         logits_zeta = result_obj['logits_zeta']
         psi1 = torch.digamma(tau1)
         psi2 = torch.digamma(tau2)
@@ -257,6 +263,7 @@ class Model(nn.Module):
         loss_pres_2 = (tau1 - self.prior_pres_alpha) * psi1
         loss_pres_3 = (tau2 - 1) * psi2
         loss_pres_4 = -(tau1 + tau2 - self.prior_pres_alpha - 1) * psi12
+        zeta = torch.sigmoid(logits_zeta)
         log_zeta = nn_func.logsigmoid(logits_zeta)
         log1m_zeta = log_zeta - logits_zeta
         psi1_le_sum = psi1.cumsum(0)
@@ -291,16 +298,17 @@ class Model(nn.Module):
         loss_obj = loss_obj.sum([0, *range(2, loss_obj.dim())])
         return loss_pres + loss_bck + loss_stn + loss_obj
 
-    def compute_step_losses(self, images, result_bck, result_obj, mask, raw_pixel_ll):
+    def compute_step_losses(self, images, result_bck, result_obj, raw_pixel_ll):
+        log_mask = self.compute_log_mask(result_obj['shp'], result_obj['pres'])
+        masked_pixel_ll = log_mask + raw_pixel_ll
+        gamma = nn.functional.softmax(masked_pixel_ll, dim=0)
+        log_gamma = nn.functional.log_softmax(masked_pixel_ll, dim=0)
         # Loss NLL
-        loss_nll = -(mask * raw_pixel_ll).sum([0, *range(2, mask.dim())])
-        # Loss reconstruction
-        apc_all = torch.cat([result_obj['apc'], result_bck['bck'][None]])
-        recon = (mask * apc_all).sum(0)
-        loss_recon = 0.5 * (self.normal_const + self.normal_invvar * (recon - images).pow(2))
-        loss_recon = loss_recon.sum([*range(1, loss_recon.dim())])
+        loss_nll = -(gamma * raw_pixel_ll).sum([0, *range(2, gamma.dim())])
         # Loss KLD
-        loss_kld = self.compute_kld(result_bck, result_obj)
+        loss_kld_part = self.compute_kld_part(result_bck, result_obj)
+        loss_kld_mask = (gamma * (log_gamma - log_mask)).sum([0, *range(2, gamma.dim())])
+        loss_kld = loss_kld_part + loss_kld_mask
         # Loss back prior
         bck_prior = images.reshape(*images.shape[:-2], -1).median(-1).values[..., None, None]
         sq_diff = (result_bck['bck'] - bck_prior).pow(2)
@@ -312,7 +320,7 @@ class Model(nn.Module):
         apc_var = result_obj['apc_crop_res'].pow(2)
         loss_apc_var = 0.5 * self.normal_invvar * apc_var.sum([0, *range(2, apc_var.dim())])
         # Losses
-        losses = {'nll': loss_nll, 'recon': loss_recon, 'kld': loss_kld, 'bck_prior': loss_bck_prior,
+        losses = {'nll': loss_nll, 'kld': loss_kld, 'kld_part': loss_kld_part, 'bck_prior': loss_bck_prior,
                   'bck_var': loss_bck_var, 'apc_var': loss_apc_var}
         return losses
 
@@ -343,7 +351,7 @@ class Model(nn.Module):
         score = torch.where(invalid, torch.ones_like(score), score)
         return score
 
-    def compute_metrics(self, images, labels, pres, mask, mask_oh_all, mask_oh_obj, recon, raw_pixel_ll, eps=1e-10):
+    def compute_metrics(self, images, labels, pres, mask_oh_all, mask_oh_obj, recon, log_mask, raw_pixel_ll):
         # ARI
         ari_all = self.compute_ari(labels, mask_oh_all)
         ari_obj = self.compute_ari(labels, mask_oh_obj)
@@ -351,7 +359,7 @@ class Model(nn.Module):
         sq_diff = (recon - images).pow(2)
         mse = sq_diff.mean([*range(1, sq_diff.dim())])
         # Log-likelihood
-        pixel_ll = torch.logsumexp(mask.clamp(min=eps).log() + raw_pixel_ll, dim=1)
+        pixel_ll = torch.logsumexp(log_mask + raw_pixel_ll, dim=1)
         ll = pixel_ll.sum([*range(1, pixel_ll.dim())])
         # Count
         pres_true = labels.reshape(*labels.shape[:-3], -1).max(-1).values

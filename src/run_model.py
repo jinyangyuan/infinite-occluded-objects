@@ -10,7 +10,7 @@ from sklearn.metrics import adjusted_mutual_info_score
 
 
 def compute_loss_coef(config, epoch):
-    loss_coef = {'kld': 1}
+    loss_coef = {'nll': 1, 'kld': 1}
     for key, val in config['loss_coef'].items():
         epoch_list = [0] + val['epoch'] + [config['num_epochs'] - 1]
         assert len(epoch_list) == len(val['value'])
@@ -29,8 +29,6 @@ def compute_loss_coef(config, epoch):
                 break
         else:
             raise ValueError
-    if 'nll' not in loss_coef:
-        loss_coef['nll'] = 1 - loss_coef['recon']
     return loss_coef
 
 
@@ -80,8 +78,16 @@ def train_model(config, data_loaders, net):
                     data = {key: val.cuda(non_blocking=True) for key, val in data.items()}
                     batch_size = data['image'].shape[0]
                     step_wt = step_wt_base.expand(batch_size, -1)
-                    with torch.set_grad_enabled(phase == 'train'):
-                        results, metrics, losses = net(data['image'], data['label'], step_wt)
+                    if phase == 'train':
+                        enable_grad = True
+                        temp = loss_coef['temp']
+                        hard = False
+                    else:
+                        enable_grad = False
+                        temp = None
+                        hard = True
+                    with torch.set_grad_enabled(enable_grad):
+                        results, metrics, losses = net(data['image'], data['label'], step_wt, temp, hard)
                     for key, val in losses.items():
                         if key in sum_losses:
                             sum_losses[key] += val.sum().item()
@@ -95,8 +101,8 @@ def train_model(config, data_loaders, net):
                     num_data += batch_size
                     if phase == 'train':
                         optimizer.zero_grad()
-                        loss_opt = torch.stack(
-                            [loss_coef[key] * losses[key].sum() for key in losses if key != 'compare']).sum()
+                        loss_opt = torch.stack([loss_coef[key] * losses[key].sum()
+                                                for key in losses if key not in ['kld_part', 'compare']]).sum()
                         loss_opt.backward()
                         optimizer.step()
                     if idx_batch == 0 and epoch % config['summ_image_intvl'] == 0:

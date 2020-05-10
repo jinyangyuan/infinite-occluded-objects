@@ -1,4 +1,5 @@
 import torch
+import torch.distributions as torch_dist
 import torch.nn as nn
 import torch.nn.functional as nn_func
 from building_block import LinearBlock, EncoderBlock, DecoderBlock
@@ -248,24 +249,29 @@ class NetworkCrop(nn.Module):
         logits_tau1, logits_tau2, logits_zeta = self.enc_pres(x_both).chunk(3, dim=-1)
         tau1 = nn_func.softplus(logits_tau1)
         tau2 = nn_func.softplus(logits_tau2)
-        zeta = torch.sigmoid(logits_zeta)
         mu, logvar = self.enc_obj(x_crop).chunk(2, dim=-1)
-        return tau1, tau2, zeta, logits_zeta, mu, logvar
+        return tau1, tau2, logits_zeta, mu, logvar
 
-    def decode(self, mu, logvar, grid_full):
+    def decode(self, logits_zeta, mu, logvar, grid_full, temp, hard):
+        if hard:
+            dist_pres = torch_dist.bernoulli.Bernoulli(logits=logits_zeta)
+            pres = dist_pres.sample()
+        else:
+            dist_pres = torch_dist.relaxed_bernoulli.RelaxedBernoulli(temp, logits=logits_zeta)
+            pres = dist_pres.rsample()
         sample = reparameterize_normal(mu, logvar)
         apc_crop, apc_crop_res = self.dec_apc(sample)
         logits_shp_crop = self.dec_shp(sample)
         shp_crop = torch.sigmoid(logits_shp_crop)
         apc = nn_func.grid_sample(apc_crop, grid_full, align_corners=False)
         shp = nn_func.grid_sample(shp_crop, grid_full, align_corners=False)
-        return apc, shp, apc_crop, apc_crop_res, shp_crop
+        return pres, apc, shp, apc_crop, apc_crop_res, shp_crop
 
-    def forward(self, x_full, x_crop, grid_full):
-        tau1, tau2, zeta, logits_zeta, mu, logvar = self.encode(x_full, x_crop)
-        apc, shp, apc_crop, apc_crop_res, shp_crop = self.decode(mu, logvar, grid_full)
+    def forward(self, x_full, x_crop, grid_full, temp, hard):
+        tau1, tau2, logits_zeta, mu, logvar = self.encode(x_full, x_crop)
+        pres, apc, shp, apc_crop, apc_crop_res, shp_crop = self.decode(logits_zeta, mu, logvar, grid_full, temp, hard)
         result = {
             'apc': apc, 'shp': shp, 'apc_crop': apc_crop, 'apc_crop_res': apc_crop_res, 'shp_crop': shp_crop,
-            'tau1': tau1, 'tau2': tau2, 'zeta': zeta, 'logits_zeta': logits_zeta, 'obj_mu': mu, 'obj_logvar': logvar,
+            'pres': pres, 'tau1': tau1, 'tau2': tau2, 'logits_zeta': logits_zeta, 'obj_mu': mu, 'obj_logvar': logvar,
         }
         return result
