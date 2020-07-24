@@ -14,9 +14,8 @@ def get_config():
     parser.add_argument('--folder_log')
     parser.add_argument('--folder_out')
     parser.add_argument('--timestamp')
-    parser.add_argument('--num_slots', type=int)
-    parser.add_argument('--num_steps', type=int)
     parser.add_argument('--num_tests', type=int)
+    parser.add_argument('--seq_update', action='store_true')
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--use_timestamp', action='store_true')
@@ -25,7 +24,6 @@ def get_config():
     parser.add_argument('--seg_overlap', action='store_true')
     parser.add_argument('--file_ckpt', default='ckpt.pickle')
     parser.add_argument('--file_model', default='model.pickle')
-    parser.add_argument('--file_result', default='result.h5')
     args = parser.parse_args()
     with open(args.path_config) as f:
         config = yaml.safe_load(f)

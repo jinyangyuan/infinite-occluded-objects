@@ -70,10 +70,7 @@ def generate_labels(objects, th=0.5):
     return labels
 
 
-def create_dataset(name, objects):
-    images = {key: generate_images(val) for key, val in objects.items()}
-    labels = {key: generate_labels(val) for key, val in objects.items()}
-    objects = {key: (val * 255).astype(np.uint8) for key, val in objects.items()}
+def save_dataset(name, images, labels, objects):
     with h5py.File('{}.h5'.format(name), 'w') as f:
         for key in images:
             f.create_group(key)
@@ -81,4 +78,12 @@ def create_dataset(name, objects):
             f[key].create_dataset('segment', data=labels[key]['segment'], compression='gzip')
             f[key].create_dataset('overlap', data=labels[key]['overlap'], compression='gzip')
             f[key].create_dataset('layers', data=objects[key], compression='gzip')
+    return
+
+
+def create_dataset(name, objects):
+    images = {key: generate_images(val) for key, val in objects.items()}
+    labels = {key: generate_labels(val) for key, val in objects.items()}
+    objects = {key: (val * 255).astype(np.uint8) for key, val in objects.items()}
+    save_dataset(name, images, labels, objects)
     return

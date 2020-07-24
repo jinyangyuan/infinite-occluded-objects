@@ -10,7 +10,7 @@ from sklearn.metrics import adjusted_mutual_info_score
 
 
 def compute_loss_coef(config, epoch):
-    loss_coef = {'nll': 1, 'kld': 1}
+    loss_coef = {'nll': 1, 'kld_bck': 1, 'kld_obj': 1, 'kld_stn': 1, 'kld_pres': 1, 'kld_mask': 1, 'recon': 0}
     for key, val in config['loss_coef'].items():
         epoch_list = [0] + val['epoch'] + [config['num_epochs'] - 1]
         assert len(epoch_list) == len(val['value'])
@@ -42,7 +42,6 @@ def get_step_wt(config):
 
 def train_model(config, data_loaders, net):
     optimizer = optim.Adam(net.parameters(), lr=config['lr'])
-    step_wt_base = get_step_wt(config)
     phase_list = ['train']
     save_phase = 'train'
     if 'valid' in data_loaders:
@@ -69,8 +68,8 @@ def train_model(config, data_loaders, net):
             loss_coef = compute_loss_coef(config, epoch)
             print('Epoch: {}/{}'.format(epoch, config['num_epochs'] - 1))
             for phase in phase_list:
-                if phase not in data_loaders:
-                    continue
+                phase_param = config['phase_param'][phase]
+                step_wt_base = get_step_wt(phase_param)
                 net.train(phase == 'train')
                 sum_losses, sum_metrics = {}, {}
                 num_data = 0
@@ -87,7 +86,8 @@ def train_model(config, data_loaders, net):
                         temp = None
                         hard = True
                     with torch.set_grad_enabled(enable_grad):
-                        results, metrics, losses = net(data['image'], data['label'], step_wt, temp, hard)
+                        results, metrics, losses = net(data['image'], data['label'], phase_param['num_slots'],
+                                                       phase_param['num_steps'], step_wt, temp, hard)
                     for key, val in losses.items():
                         if key in sum_losses:
                             sum_losses[key] += val.sum().item()
@@ -101,8 +101,8 @@ def train_model(config, data_loaders, net):
                     num_data += batch_size
                     if phase == 'train':
                         optimizer.zero_grad()
-                        loss_opt = torch.stack([loss_coef[key] * losses[key].sum()
-                                                for key in losses if key not in ['kld_part', 'compare']]).sum()
+                        loss_opt = torch.stack(
+                            [loss_coef[key] * val.mean() for key, val in losses.items() if key != 'compare']).sum()
                         loss_opt.backward()
                         optimizer.step()
                     if idx_batch == 0 and epoch % config['summ_image_intvl'] == 0:
@@ -145,6 +145,8 @@ def train_model(config, data_loaders, net):
 
 
 def test_model(config, data_loaders, net):
+    def get_path_save():
+        return os.path.join(config['folder_out'], '{}.h5'.format(phase))
     def compute_ami(seg_true_list, seg_pred_list, seg_valid_list):
         ami_list = []
         for seg_true, seg_pred, seg_valid in zip(seg_true_list, seg_pred_list, seg_valid_list):
@@ -178,86 +180,94 @@ def test_model(config, data_loaders, net):
         sum_scores = (sq_diffs * objects_a).sum().astype(np.float32)
         sum_weights = objects_a.sum().astype(np.float32)
         return sum_scores, sum_weights
+    phase_list = [n for n in config['phase_param'] if n not in ['train', 'valid']]
+    for phase in phase_list:
+        path_save = get_path_save()
+        if os.path.exists(path_save):
+            raise FileExistsError(path_save)
     path_model = os.path.join(config['folder_out'], config['file_model'])
-    path_result = os.path.join(config['folder_out'], config['file_result'])
-    if os.path.exists(path_result):
-        raise FileExistsError(path_result)
-    step_wt_base = get_step_wt(config)
     net.load_state_dict(torch.load(path_model))
     net.train(False)
-    with h5py.File(path_result, 'a') as f:
-        if config['save_detail']:
-            f.create_group('detail')
-        all_metrics = {}
-        for idx_run in range(config['num_tests']):
-            sum_metrics, sum_metrics_extra = {}, {}
-            num_data = 0
-            for data in data_loaders['test']:
-                data = {key: val if key == 'layers' else val.cuda(non_blocking=True) for key, val in data.items()}
-                batch_size = data['image'].shape[0]
-                step_wt = step_wt_base.expand(batch_size, -1)
-                with torch.set_grad_enabled(False):
-                    results, metrics, _ = net(data['image'], data['label'], step_wt)
-                segment_true = data['label'].argmax(1).data.cpu().numpy()
-                segment_valid = (data['label'].sum(1) != 0).data.cpu().numpy()
-                segment_pred_all = results['segment_all'].squeeze(1).data.cpu().numpy()
-                segment_pred_obj = results['segment_obj'].squeeze(1).data.cpu().numpy()
-                metrics['ami_all'] = compute_ami(segment_true, segment_pred_all, segment_valid)
-                metrics['ami_obj'] = compute_ami(segment_true, segment_pred_obj, segment_valid)
-                mask_true = data['label']
-                if config['seg_bck']:
-                    mask_true = mask_true[:, 1:]
-                mask_pred = results['mask'][:, :-1]
-                metrics_extra = {}
-                if 'layers' in data and mask_true.shape[1] <= mask_pred.shape[1]:
-                    order_cost = -(mask_true[:, :, None] * mask_pred[:, None]).sum([-3, -2, -1]).data.cpu().numpy()
-                    order = compute_order(order_cost)
-                    layers = data['layers'].numpy()
-                    metrics_extra['order'] = compute_ooa(layers, order)
-                    apc = results['apc'].data.cpu().numpy()
-                    metrics_extra['layer_mse'] = compute_layer_mse(layers, apc, order)
-                for key, val in metrics.items():
-                    if key in sum_metrics:
-                        sum_metrics[key] += val.sum().item()
-                    else:
-                        sum_metrics[key] = val.sum().item()
-                for key, val in metrics_extra.items():
-                    if key in sum_metrics_extra:
-                        sum_metrics_extra[key][0] += val[0]
-                        sum_metrics_extra[key][1] += val[1]
-                    else:
-                        sum_metrics_extra[key] = list(val)
-                num_data += batch_size
-                if idx_run == 0 and config['save_detail']:
-                    for key in ['apc', 'shp', 'pres']:
-                        val = (results[key].data.clamp_(0, 1).mul_(255)).to(dtype=torch.uint8).cpu().numpy()
-                        if key in f['detail']:
-                            f['detail'][key].resize(f['detail'][key].shape[0] + val.shape[0], axis=0)
-                            f['detail'][key][-val.shape[0]:] = val
+    for phase in phase_list:
+        phase_param = config['phase_param'][phase]
+        step_wt_base = get_step_wt(phase_param)
+        path_save = get_path_save()
+        data_key = phase_param['key'] if 'key' in phase_param else phase
+        with h5py.File(path_save, 'a') as f:
+            if config['save_detail']:
+                f.create_group('detail')
+            all_metrics = {}
+            for idx_run in range(config['num_tests']):
+                sum_metrics, sum_metrics_extra = {}, {}
+                num_data = 0
+                for data in data_loaders[data_key]:
+                    data = {key: val if key == 'layers' else val.cuda(non_blocking=True) for key, val in data.items()}
+                    batch_size = data['image'].shape[0]
+                    step_wt = step_wt_base.expand(batch_size, -1)
+                    with torch.set_grad_enabled(False):
+                        results, metrics, _ = net(
+                            data['image'], data['label'], phase_param['num_slots'], phase_param['num_steps'], step_wt)
+                    segment_true = data['label'].argmax(1).data.cpu().numpy()
+                    segment_valid = (data['label'].sum(1) != 0).data.cpu().numpy()
+                    segment_pred_all = results['segment_all'].squeeze(1).data.cpu().numpy()
+                    segment_pred_obj = results['segment_obj'].squeeze(1).data.cpu().numpy()
+                    metrics['ami_all'] = compute_ami(segment_true, segment_pred_all, segment_valid)
+                    metrics['ami_obj'] = compute_ami(segment_true, segment_pred_obj, segment_valid)
+                    mask_true = data['label']
+                    if config['seg_bck']:
+                        mask_true = mask_true[:, 1:]
+                    mask_pred = results['mask'][:, :-1]
+                    metrics_extra = {}
+                    if 'layers' in data and mask_true.shape[1] <= mask_pred.shape[1]:
+                        order_cost = -(mask_true[:, :, None] * mask_pred[:, None]).sum([-3, -2, -1]).data.cpu().numpy()
+                        order = compute_order(order_cost)
+                        layers = data['layers'].numpy()
+                        metrics_extra['order'] = compute_ooa(layers, order)
+                        apc = results['apc'].data.cpu().numpy()
+                        metrics_extra['layer_mse'] = compute_layer_mse(layers, apc, order)
+                    for key, val in metrics.items():
+                        if key in sum_metrics:
+                            sum_metrics[key] += val.sum().item()
                         else:
-                            f['detail'].create_dataset(
-                                key, data=val, maxshape=[None, *val.shape[1:]], compression='gzip')
-            mean_metrics = {key: val / num_data for key, val in sum_metrics.items()}
-            mean_metrics.update({key: val[0] / val[1] for key, val in sum_metrics_extra.items()})
-            for key, val in mean_metrics.items():
+                            sum_metrics[key] = val.sum().item()
+                    for key, val in metrics_extra.items():
+                        if key in sum_metrics_extra:
+                            sum_metrics_extra[key][0] += val[0]
+                            sum_metrics_extra[key][1] += val[1]
+                        else:
+                            sum_metrics_extra[key] = list(val)
+                    num_data += batch_size
+                    if idx_run == 0 and config['save_detail']:
+                        for key in ['apc', 'shp', 'pres']:
+                            val = (results[key].data.clamp_(0, 1).mul_(255)).to(dtype=torch.uint8).cpu().numpy()
+                            if key in f['detail']:
+                                f['detail'][key].resize(f['detail'][key].shape[0] + val.shape[0], axis=0)
+                                f['detail'][key][-val.shape[0]:] = val
+                            else:
+                                f['detail'].create_dataset(
+                                    key, data=val, maxshape=[None, *val.shape[1:]], compression='gzip')
+                mean_metrics = {key: val / num_data for key, val in sum_metrics.items()}
+                mean_metrics.update({key: val[0] / val[1] for key, val in sum_metrics_extra.items()})
+                for key, val in mean_metrics.items():
+                    if key in all_metrics:
+                        all_metrics[key].append(val)
+                    else:
+                        all_metrics[key] = [val]
+            f.create_group('metric')
+            for key, val in all_metrics.items():
+                f['metric'].create_dataset(key, data=np.array(val, dtype=np.float32))
+            metrics_mean = {key: np.mean(val) for key, val in all_metrics.items()}
+            metrics_std = {key: np.std(val) for key, val in all_metrics.items()}
+            format_list = [
+                ('ARI_All', '3f'), ('ARI_Obj', '3f'), ('AMI_All', '3f'), ('AMI_Obj', '3f'),
+                ('Count', '3f'), ('Order', '3f'), ('LL', '1f'), ('MSE', '2e'), ('Layer_MSE', '2e'),
+            ]
+            print(phase)
+            for name, mean_fmt in format_list:
+                key = name.lower()
                 if key in all_metrics:
-                    all_metrics[key].append(val)
-                else:
-                    all_metrics[key] = [val]
-        f.create_group('metric')
-        for key, val in all_metrics.items():
-            f['metric'].create_dataset(key, data=np.array(val, dtype=np.float32))
-        metrics_mean = {key: np.mean(val) for key, val in all_metrics.items()}
-        metrics_std = {key: np.std(val) for key, val in all_metrics.items()}
-        format_list = [
-            ('ARI_All', '3f'), ('ARI_Obj', '3f'), ('AMI_All', '3f'), ('AMI_Obj', '3f'),
-            ('Count', '3f'), ('Order', '3f'), ('LL', '1f'), ('MSE', '2e'), ('Layer_MSE', '2e'),
-        ]
-        for name, mean_fmt in format_list:
-            key = name.lower()
-            if key in all_metrics:
-                print(name)
-                print(('Mean: {:.' + mean_fmt + '}').format(metrics_mean[key]))
-                print('Std:  {:.2e}'.format(metrics_std[key]))
-                print()
+                    print(name)
+                    print(('Mean: {:.' + mean_fmt + '}').format(metrics_mean[key]))
+                    print('Std:  {:.2e}'.format(metrics_std[key]))
+                    print()
     return

@@ -35,20 +35,20 @@ class Dataset(utils_data.Dataset):
 
 
 def get_data_loaders(config):
-    phase_list = ['test']
-    if config['train']:
-        phase_list += ['train', 'valid']
     image_shape = None
     data_loaders = {}
     with h5py.File(config['path_data'], 'r', libver='latest', swmr=True) as f:
+        phase_list = [*f.keys()]
+        if not config['train']:
+            phase_list = [n for n in phase_list if n not in ['train', 'valid']]
         for phase in phase_list:
-            if phase not in f:
-                continue
             data = {key: f[phase][key][()] for key in ['image', 'segment', 'overlap']}
-            if phase == 'test' and 'layers' in f[phase]:
+            if 'layers' in f[phase] and phase not in ['train', 'valid']:
                 data['layers'] = f[phase]['layers'][()]
             if image_shape is None:
                 image_shape = data['image'].shape[-3:]
+            else:
+                assert image_shape == data['image'].shape[-3:]
             data_loaders[phase] = utils_data.DataLoader(
                 Dataset(config, data),
                 batch_size=config['batch_size'],

@@ -57,3 +57,15 @@ for only_object in 1 0; do
         done
     done
 done
+
+# Combine
+for occlude in 'sep' 'occ'; do
+    for color in 'gray' 'rgb_1' 'rgb_2' 'rgb_3' 'rgb_4'; do
+        folder=$occlude'_'$color
+        for object in 'shapes' 'mnist'; do
+            python $folder_src'/combine.py' \
+                --folder $folder \
+                --name $object
+        done
+    done
+done

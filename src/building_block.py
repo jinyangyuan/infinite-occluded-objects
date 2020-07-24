@@ -64,7 +64,7 @@ class Interpolate(nn.Module):
         self.size = size
 
     def forward(self, x):
-        return nn_func.interpolate(x, size=self.size)
+        return nn_func.interpolate(x, size=self.size, mode='bilinear', align_corners=False)
 
 
 class LinearBlock(nn.Sequential):

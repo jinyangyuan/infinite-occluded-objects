@@ -11,7 +11,6 @@ This is the code repository of the paper ["Generative Modeling of Infinite Occlu
 - pyyaml == 5.3
 - scipy == 1.4
 - scikit-learn == 0.22
-- tensorboard == 2.1
 
 ### Datasets
 

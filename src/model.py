@@ -11,17 +11,13 @@ class Model(nn.Module):
     def __init__(self, config):
         super(Model, self).__init__()
         # Hyperparameters
-        self.register_buffer('prior_stn_mu', torch.tensor(config['prior_stn_mu'])[None, None])
-        self.register_buffer('prior_stn_invvar', 1 / torch.tensor(config['prior_stn_std']).pow(2)[None, None])
-        self.register_buffer('prior_stn_logvar', -self.prior_stn_invvar.log())
-        self.obj_slots = config['num_slots'] - 1
-        self.num_steps = config['num_steps']
         self.image_shape = config['image_shape']
         self.crop_shape = config['crop_shape']
         self.normal_invvar = 1 / pow(config['normal_scale'], 2)
         self.normal_const = math.log(2 * math.pi / self.normal_invvar)
         self.prior_pres_alpha = config['prior_pres_alpha']
         self.prior_pres_log_alpha = math.log(self.prior_pres_alpha)
+        self.seq_update = config['seq_update']
         self.seg_bck = config['seg_bck']
         # Neural networks
         self.init_back = InitializerBack(config)
@@ -34,95 +30,42 @@ class Model(nn.Module):
         self.net_full = NetworkFull(config)
         self.net_crop = NetworkCrop(config)
 
-    def forward(self, images, labels, step_wt, temp=None, hard=True):
-        ###################
-        # Initializations #
-        ###################
-        # Background
+    def forward(self, images, labels, num_slots, num_steps, step_wt, temp=None, hard=True):
+        # Initializations
+        obj_slots = num_slots - 1
         states_back = self.init_back(images)
         result_bck = self.net_back(states_back[0])
-        # Objects
-        result_obj = {
-            'apc': torch.zeros([0, *images.shape], device=images.device),
-            'shp': torch.zeros([0, images.shape[0], 1, *images.shape[2:]], device=images.device),
-            'pres': torch.zeros([0, images.shape[0], 1], device=images.device),
-        }
-        result_obj.update({
-            key: None for key in
-            [
-                'tau1', 'tau2', 'logits_zeta', 'stn_mu', 'stn_logvar', 'obj_mu', 'obj_logvar',
-                'scl', 'trs', 'apc_crop', 'apc_crop_res', 'shp_crop',
-            ]
-        })
-        states_dict = {key: [] for key in ['states_full', 'states_crop']}
-        states_main = None
-        for _ in range(self.obj_slots):
-            # Full
-            init_full_in = self.compute_init_full_in(images, result_bck, result_obj)
-            states_full, states_main = self.init_full(init_full_in, states_main)
-            result_full = self.net_full(states_full[0])
-            # Crop
-            grid_crop, grid_full = self.compute_grid(result_full['scl'], result_full['trs'])
-            init_crop_in = nn_func.grid_sample(init_full_in, grid_crop, align_corners=False)
-            states_crop = self.init_crop(init_crop_in)
-            result_crop = self.net_crop(states_full[0], states_crop[0], grid_full, temp, hard)
-            # Update storage
-            update_dict = {**result_full, **result_crop, 'states_full': states_full, 'states_crop': states_crop}
-            self.initialize_storage(result_obj, states_dict, update_dict)
-        # Adjust order
-        self.adjust_order(images, result_obj, states_dict)
-        # Losses
-        raw_pixel_ll = self.compute_raw_pixel_ll(images, result_bck['bck'], result_obj['apc'])
-        step_losses = self.compute_step_losses(images, result_bck, result_obj, raw_pixel_ll)
+        result_obj, states_dict = self.initialize_obj(images, result_bck, obj_slots, temp, hard)
+        step_losses, kld_part = self.compute_step_losses(images, result_bck, result_obj)
         losses = {key: [val] for key, val in step_losses.items()}
-        ###############
-        # Refinements #
-        ###############
-        for _ in range(self.num_steps):
-            # Background
+        # Refinements
+        for step in range(num_steps):
             upd_back_in = self.compute_upd_back_in(images, result_bck, result_obj)
             states_back = self.upd_back(upd_back_in, states_back)
             result_bck = self.net_back(states_back[0])
-            # Objects
-            for idx_obj in range(self.obj_slots):
-                # Full
-                upd_full_in = self.compute_upd_full_in(images, result_bck, result_obj, idx_obj)
-                states_full = self.upd_full(upd_full_in, states_dict['states_full'][idx_obj])
-                result_full = self.net_full(states_full[0])
-                # Crop
-                grid_crop, grid_full = self.compute_grid(result_full['scl'], result_full['trs'])
-                upd_crop_in = self.compute_upd_crop_in(result_bck, result_obj, upd_full_in, grid_crop, idx_obj)
-                states_crop = self.upd_crop(upd_crop_in, states_dict['states_crop'][idx_obj])
-                result_crop = self.net_crop(states_full[0], states_crop[0], grid_full, temp, hard)
-                # Update storage
-                update_dict = {**result_full, **result_crop, 'states_full': states_full, 'states_crop': states_crop}
-                self.update_storage(result_obj, states_dict, update_dict, idx_obj)
-            # Adjust order
-            self.adjust_order(images, result_obj, states_dict)
-            # Losses
-            raw_pixel_ll = self.compute_raw_pixel_ll(images, result_bck['bck'], result_obj['apc'])
-            step_losses = self.compute_step_losses(images, result_bck, result_obj, raw_pixel_ll)
+            result_obj, states_dict = self.update_obj(images, result_bck, result_obj, states_dict, temp, hard)
+            step_losses, kld_part = self.compute_step_losses(images, result_bck, result_obj)
+            step_losses['bck_prior'] = step_losses['bck_prior'] * (num_steps - step - 1) / num_steps
             for key, val in step_losses.items():
                 losses[key].append(val)
-        ###########
-        # Outputs #
-        ###########
-        # Losses
+        # Outputs
         sum_step_wt = step_wt.sum(1)
         losses = {key: torch.stack(val, dim=1) for key, val in losses.items()}
         losses = {key: (step_wt * val).sum(1) / sum_step_wt for key, val in losses.items()}
-        # Results
-        apc_all = torch.cat([result_obj['apc'], result_bck['bck'][None]]).transpose(0, 1)
-        shp = result_obj['shp']
+        indices = self.compute_indices(images, result_obj)
+        perm_vals = {key: self.permute(result_obj[key], indices) for key in ['apc', 'shp', 'pres', 'scl', 'trs']}
+        apc_all = torch.cat([perm_vals['apc'], result_bck['bck'][None]]).transpose(0, 1)
+        shp = perm_vals['shp']
         shp_all = torch.cat([shp, torch.ones([1, *shp.shape[1:]], device=shp.device)]).transpose(0, 1)
-        pres = torch.ge(result_obj['pres'], 0.5).type(torch.float)
+        pres = torch.ge(perm_vals['pres'], 0.5).type(torch.float)
         mask = self.compute_mask(shp, pres).transpose(0, 1)
         log_mask = self.compute_log_mask(shp, pres).transpose(0, 1)
         pres = pres.squeeze(-1).transpose(0, 1)
         pres_all = torch.cat([pres, torch.ones([pres.shape[0], 1], device=images.device)], dim=1)
         recon = (mask * apc_all).sum(1)
-        scl = result_obj['scl'].transpose(0, 1)
-        trs = result_obj['trs'].transpose(0, 1)
+        scl = perm_vals['scl'].transpose(0, 1)
+        trs = perm_vals['trs'].transpose(0, 1)
+        raw_pixel_ll = self.compute_raw_pixel_ll(images, result_bck['bck'], perm_vals['apc'])
         raw_pixel_ll = raw_pixel_ll.transpose(0, 1)
         segment_all = torch.argmax(mask, dim=1, keepdim=True)
         segment_obj = torch.argmax(mask[:, :-1], dim=1, keepdim=True)
@@ -132,10 +75,81 @@ class Model(nn.Module):
         mask_oh_obj.scatter_(1, segment_obj, 1)
         results = {'apc': apc_all, 'shp': shp_all, 'pres': pres_all, 'scl': scl, 'trs': trs, 'recon': recon,
                    'mask': mask, 'segment_all': segment_all, 'segment_obj': segment_obj}
-        # Metrics
         metrics = self.compute_metrics(images, labels, pres, mask_oh_all, mask_oh_obj, recon, log_mask, raw_pixel_ll)
-        losses['compare'] = -metrics['ll'] + step_losses['kld_part']
+        losses['compare'] = -metrics['ll'] + kld_part
         return results, metrics, losses
+
+    def initialize_obj(self, images, result_bck, obj_slots, temp, hard):
+        result_obj = {
+            'apc': torch.zeros([0, *images.shape], device=images.device),
+            'shp': torch.zeros([0, images.shape[0], 1, *images.shape[2:]], device=images.device),
+            'pres': torch.zeros([0, images.shape[0], 1], device=images.device),
+        }
+        states_dict = {key: [] for key in ['full', 'crop']}
+        states_main = None
+        for _ in range(obj_slots):
+            # Full
+            init_full_in = self.compute_init_full_in(images, result_bck, result_obj)
+            states_full, states_main = self.init_full(init_full_in, states_main)
+            result_full = self.net_full(states_full[0])
+            # Crop
+            grid_crop, grid_full = self.compute_grid(result_full['scl'], result_full['trs'])
+            init_crop_in = nn_func.grid_sample(init_full_in, grid_crop, align_corners=False).detach()
+            states_crop = self.init_crop(init_crop_in)
+            result_crop = self.net_crop(states_full[0], states_crop[0], grid_full, temp, hard)
+            # Update storage
+            update_dict = {**result_full, **result_crop}
+            for key, val in update_dict.items():
+                if key in result_obj:
+                    result_obj[key] = torch.cat([result_obj[key], val[None]])
+                else:
+                    result_obj[key] = val[None]
+            update_dict = {'full': states_full, 'crop': states_crop}
+            for key, val in update_dict.items():
+                states_dict[key].append(val)
+        if not self.seq_update:
+            for key, val in states_dict.items():
+                states_dict[key] = tuple([torch.cat(n) for n in zip(*val)])
+        return result_obj, states_dict
+
+    def update_obj(self, images, result_bck, result_obj, states_dict, temp, hard):
+        obj_slots = result_obj['apc'].shape[0]
+        if self.seq_update:
+            for idx in range(obj_slots):
+                # Full
+                upd_full_in = self.compute_upd_full_in_seq(images, result_bck, result_obj, idx)
+                states_full = self.upd_full(upd_full_in, states_dict['full'][idx])
+                result_full = self.net_full(states_full[0])
+                # Crop
+                grid_crop, grid_full = self.compute_grid(result_full['scl'], result_full['trs'])
+                upd_crop_in = self.compute_upd_crop_in_seq(result_obj, upd_full_in, grid_crop, idx)
+                states_crop = self.upd_crop(upd_crop_in, states_dict['crop'][idx])
+                result_crop = self.net_crop(states_full[0], states_crop[0], grid_full, temp, hard)
+                # Update storage
+                update_dict = {**result_full, **result_crop}
+                for key, val in result_obj.items():
+                    result_obj[key] = torch.cat([val[:idx], update_dict[key][None], val[idx + 1:]])
+                update_dict = {'full': states_full, 'crop': states_crop}
+                for key, val in states_dict.items():
+                    states_dict[key] = val[:idx] + [update_dict[key]] + val[idx + 1:]
+        else:
+            # Full
+            upd_full_in = self.compute_upd_full_in_para(images, result_bck, result_obj)
+            states_full = self.upd_full(upd_full_in, states_dict['full'])
+            result_full = self.net_full(states_full[0])
+            # Crop
+            grid_crop, grid_full = self.compute_grid(result_full['scl'], result_full['trs'])
+            upd_crop_in = self.compute_upd_crop_in_para(result_obj, upd_full_in, grid_crop)
+            states_crop = self.upd_crop(upd_crop_in, states_dict['crop'])
+            result_crop = self.net_crop(states_full[0], states_crop[0], grid_full, temp, hard)
+            # Update storage
+            update_dict = {**result_full, **result_crop}
+            for key, val in update_dict.items():
+                result_obj[key] = val.reshape(obj_slots, -1, *val.shape[1:])
+            update_dict = {'full': states_full, 'crop': states_crop}
+            for key, val in update_dict.items():
+                states_dict[key] = val
+        return result_obj, states_dict
 
     def compute_grid(self, scl, trs):
         batch_size = scl.shape[0]
@@ -166,65 +180,15 @@ class Model(nn.Module):
         zeros = torch.zeros([1, *x.shape[1:]], device=x.device)
         return torch.cat([log_x, zeros]) + torch.cat([zeros, log1m_x]).cumsum(0)
 
-    def compute_init_full_in(self, images, result_bck, result_obj):
-        mask = self.compute_mask(result_obj['shp'], result_obj['pres'])
-        recon = (mask * torch.cat([result_obj['apc'], result_bck['bck'][None]])).sum(0)
-        return torch.cat([images, recon, mask[-1]], dim=1).detach()
-
-    def compute_upd_back_in(self, images, result_bck, result_obj):
-        inputs_excl = self.compute_init_full_in(images, result_bck, result_obj)
-        return torch.cat([inputs_excl, result_bck['bck']], dim=1).detach()
-
-    def compute_upd_full_in(self, images, result_bck, result_obj, idx):
-        mask_above = self.compute_mask(result_obj['shp'][:idx], result_obj['pres'][:idx])
-        mask_below = self.compute_mask(result_obj['shp'][idx + 1:], result_obj['pres'][idx + 1:])
-        mask_cur = self.compute_mask(result_obj['shp'][idx:idx + 1], result_obj['pres'][idx:idx + 1])
-        recon_above = (mask_above * torch.cat([result_obj['apc'][:idx], result_bck['bck'][None]])).sum(0)
-        recon_below = (mask_below * torch.cat([result_obj['apc'][idx + 1:], result_bck['bck'][None]])).sum(0)
-        recon_cur = (mask_cur * torch.cat([result_obj['apc'][idx:idx + 1], result_bck['bck'][None]])).sum(0)
-        return torch.cat([images, recon_above, recon_below, mask_above[-1], recon_cur, mask_cur[-1]], dim=1).detach()
-
-    def compute_upd_crop_in(self, result_bck, result_obj, upd_full_in, grid_crop, idx):
-        excl_dims = self.image_shape[0] + 1
-        inputs_excl = nn_func.grid_sample(upd_full_in[:, :-excl_dims], grid_crop, align_corners=False)
-        bck_crop = nn_func.grid_sample(result_bck['bck'], grid_crop, align_corners=False)
-        mask_cur = self.compute_mask(result_obj['shp_crop'][idx:idx + 1], result_obj['pres'][idx:idx + 1])
-        recon_cur = (mask_cur * torch.cat([result_obj['apc_crop'][idx:idx + 1], bck_crop[None]])).sum(0)
-        return torch.cat([inputs_excl, recon_cur, mask_cur[-1]], dim=1).detach()
-
-    @staticmethod
-    def initialize_storage(result_obj, states_dict, update_dict):
-        for key, val in result_obj.items():
-            if val is None:
-                result_obj[key] = update_dict[key][None]
-            else:
-                result_obj[key] = torch.cat([val, update_dict[key][None]])
-        for key in states_dict:
-            states_dict[key].append(update_dict[key])
-        return
-
-    @staticmethod
-    def update_storage(result_obj, states_dict, update_dict, idx):
-        for key, val in result_obj.items():
-            result_obj[key] = torch.cat([val[:idx], update_dict[key][None], val[idx + 1:]])
-        for key, val in states_dict.items():
-            states_dict[key] = val[:idx] + [update_dict[key]] + val[idx + 1:]
-        return
-
-    def adjust_order(self, images, result_obj, states_dict, eps=1e-5):
-        def permute(x):
-            if x.dim() == 3:
-                indices_expand = indices
-            else:
-                indices_expand = indices[..., None, None]
-            x = torch.gather(x, 0, indices_expand.expand(-1, -1, *x.shape[2:]))
-            return x
+    def compute_indices(self, images, result_obj, eps=1e-5):
         sq_diffs = (result_obj['apc'] - images[None]).pow(2).sum(-3, keepdim=True).detach()
         visibles = result_obj['shp'].clone().detach()
         pres = result_obj['pres'].detach()
         coefs = torch.ones(visibles.shape[:-2], device=visibles.device)
+        if coefs.shape[0] == 0:
+            return coefs.type(torch.long)
         indices_list = []
-        for _ in range(self.obj_slots):
+        for _ in range(coefs.shape[0]):
             vis_sq_diffs = (visibles * sq_diffs).sum([-2, -1])
             vis_areas = visibles.sum([-2, -1])
             vis_max_vals = visibles.reshape(*visibles.shape[:-2], -1).max(-1).values
@@ -235,34 +199,100 @@ class Model(nn.Module):
             vis = torch.gather(visibles, 0, indices[..., None, None].expand(-1, -1, *visibles.shape[2:]))
             visibles *= 1 - vis
             coefs.scatter_(0, indices, -1)
-        indices = torch.cat(indices_list)
-        for key, val in result_obj.items():
-            result_obj[key] = permute(val)
-        for key, val in states_dict.items():
-            states_0 = permute(torch.stack([n[0] for n in val]))
-            states_1 = permute(torch.stack([n[1] for n in val]))
-            states_dict[key] = [(n_0, n_1) for n_0, n_1 in zip(states_0, states_1)]
-        return
+        return torch.cat(indices_list)
+
+    @staticmethod
+    def permute(x, indices):
+        if x.ndim == 3:
+            indices_expand = indices
+        else:
+            indices_expand = indices[..., None, None]
+        x = torch.gather(x, 0, indices_expand.expand(-1, -1, *x.shape[2:]))
+        return x
+
+    def compute_init_full_in(self, images, result_bck, result_obj):
+        indices = self.compute_indices(images, result_obj)
+        perm_vals = {key: self.permute(result_obj[key], indices) for key in ['apc', 'shp', 'pres']}
+        mask = self.compute_mask(perm_vals['shp'], perm_vals['pres'])
+        recon = (mask * torch.cat([perm_vals['apc'], result_bck['bck'][None]])).sum(0)
+        return torch.cat([images, recon, mask[-1]], dim=1).detach()
+
+    def compute_upd_back_in(self, images, result_bck, result_obj):
+        inputs_excl = self.compute_init_full_in(images, result_bck, result_obj)
+        return torch.cat([inputs_excl, result_bck['bck']], dim=1).detach()
+
+    def compute_upd_full_in_seq(self, images, result_bck, result_obj, idx):
+        indices = self.compute_indices(images, result_obj)
+        perm_vals = {key: self.permute(result_obj[key], indices) for key in ['apc', 'shp', 'pres']}
+        pos_cur = torch.eq(indices, idx)
+        pres_excl = torch.where(pos_cur, torch.zeros_like(perm_vals['pres']), perm_vals['pres'])
+        mask_excl = self.compute_mask(perm_vals['shp'], pres_excl)
+        recon_excl = (mask_excl * torch.cat([perm_vals['apc'], result_bck['bck'][None]])).sum(0)
+        pos_above = torch.eq(pos_cur.type(torch.int32).cumsum(0), 0)
+        pos_above = pos_above[..., None, None].expand(-1, -1, -1, *self.image_shape[1:])
+        shp_above = torch.where(pos_above, mask_excl[:-1], torch.zeros_like(mask_excl[:-1])).sum(0)
+        apc_cur = result_obj['apc'][idx]
+        shp_cur = result_obj['shp'][idx]
+        pres_cur = result_obj['pres'][idx, ..., None, None].expand(-1, -1, *self.image_shape[1:])
+        return torch.cat([images, recon_excl, shp_above, apc_cur, shp_cur, pres_cur], dim=1).detach()
+
+    def compute_upd_full_in_para(self, images, result_bck, result_obj):
+        obj_slots = result_obj['apc'].shape[0]
+        indices = self.compute_indices(images, result_obj)
+        perm_vals = {key: self.permute(result_obj[key], indices) for key in ['apc', 'shp', 'pres']}
+        images = images[None].expand(obj_slots, -1, -1, -1, -1)
+        bck = result_bck['bck'][None].expand(obj_slots, -1, -1, -1, -1)
+        indices = indices[:, None].expand(-1, obj_slots, -1, -1)
+        perm_vals = {key: val[:, None].expand(-1, obj_slots, *([-1] * (val.ndim - 1)))
+                     for key, val in perm_vals.items()}
+        pos_cur = torch.eq(indices, torch.arange(obj_slots, device=indices.device)[None, :, None, None])
+        pres_excl = torch.where(pos_cur, torch.zeros_like(perm_vals['pres']), perm_vals['pres'])
+        mask_excl = self.compute_mask(perm_vals['shp'], pres_excl)
+        recon_excl = (mask_excl * torch.cat([perm_vals['apc'], bck[None]])).sum(0)
+        pos_above = torch.eq(pos_cur.type(torch.int32).cumsum(0), 0)
+        pos_above = pos_above[..., None, None].expand(-1, -1, -1, -1, *self.image_shape[1:])
+        shp_above = torch.where(pos_above, mask_excl[:-1], torch.zeros_like(mask_excl[:-1])).sum(0)
+        apc_cur = result_obj['apc']
+        shp_cur = result_obj['shp']
+        pres_cur = result_obj['pres'][..., None, None].expand(-1, -1, -1, *self.image_shape[1:])
+        inputs = torch.cat([images, recon_excl, shp_above, apc_cur, shp_cur, pres_cur], dim=2).detach()
+        return inputs.reshape(-1, *inputs.shape[2:])
+
+    def compute_upd_crop_in_seq(self, result_obj, upd_full_in, grid_crop, idx):
+        excl_dims = self.image_shape[0] + 2
+        inputs_excl = nn_func.grid_sample(upd_full_in[:, :-excl_dims], grid_crop, align_corners=False)
+        apc_cur = result_obj['apc_crop'][idx]
+        shp_cur = result_obj['shp_crop'][idx]
+        pres_cur = result_obj['pres'][idx, ..., None, None].expand(-1, -1, *self.crop_shape[1:])
+        return torch.cat([inputs_excl, apc_cur, shp_cur, pres_cur], dim=1).detach()
+
+    def compute_upd_crop_in_para(self, result_obj, upd_full_in, grid_crop):
+        obj_slots = result_obj['apc'].shape[0]
+        excl_dims = self.image_shape[0] + 2
+        inputs_excl = nn_func.grid_sample(upd_full_in[:, :-excl_dims], grid_crop, align_corners=False)
+        inputs_excl = inputs_excl.reshape(obj_slots, -1, *inputs_excl.shape[1:])
+        apc_cur = result_obj['apc_crop']
+        shp_cur = result_obj['shp_crop']
+        pres_cur = result_obj['pres'][..., None, None].expand(-1, -1, -1, *self.crop_shape[1:])
+        inputs = torch.cat([inputs_excl, apc_cur, shp_cur, pres_cur], dim=2).detach()
+        return inputs.reshape(-1, *inputs.shape[2:])
 
     def compute_raw_pixel_ll(self, images, bck, apc):
-        diff = torch.cat([apc, bck[None]]) - images[None]
-        raw_pixel_ll = -0.5 * (self.normal_const + self.normal_invvar * diff.pow(2)).sum(-3, keepdim=True)
+        sq_diff = (torch.cat([apc, bck[None]]) - images[None]).pow(2)
+        raw_pixel_ll = -0.5 * (self.normal_const + self.normal_invvar * sq_diff).sum(-3, keepdim=True)
         return raw_pixel_ll
 
-    def compute_kld_part(self, result_bck, result_obj):
-        def compute_kld_normal(mu, logvar, prior_mu, prior_logvar, prior_invvar):
-            return 0.5 * (prior_logvar - logvar + prior_invvar * ((mu - prior_mu).pow(2) + logvar.exp()) - 1)
-        # Presence
+    def compute_kld_pres(self, result_obj):
         tau1 = result_obj['tau1']
         tau2 = result_obj['tau2']
         logits_zeta = result_obj['logits_zeta']
         psi1 = torch.digamma(tau1)
         psi2 = torch.digamma(tau2)
         psi12 = torch.digamma(tau1 + tau2)
-        loss_pres_1 = torch.lgamma(tau1 + tau2) - torch.lgamma(tau1) - torch.lgamma(tau2) - self.prior_pres_log_alpha
-        loss_pres_2 = (tau1 - self.prior_pres_alpha) * psi1
-        loss_pres_3 = (tau2 - 1) * psi2
-        loss_pres_4 = -(tau1 + tau2 - self.prior_pres_alpha - 1) * psi12
+        kld_1 = torch.lgamma(tau1 + tau2) - torch.lgamma(tau1) - torch.lgamma(tau2) - self.prior_pres_log_alpha
+        kld_2 = (tau1 - self.prior_pres_alpha) * psi1
+        kld_3 = (tau2 - 1) * psi2
+        kld_4 = -(tau1 + tau2 - self.prior_pres_alpha - 1) * psi12
         zeta = torch.sigmoid(logits_zeta)
         log_zeta = nn_func.logsigmoid(logits_zeta)
         log1m_zeta = log_zeta - logits_zeta
@@ -272,7 +302,7 @@ class Model(nn.Module):
         psi1_lt_sum = torch.cat([torch.zeros([1, *psi1_le_sum.shape[1:]], device=zeta.device), psi1_le_sum[:-1]])
         logits_coef = psi2 + psi1_lt_sum - psi12_le_sum
         kappa2_list = []
-        for idx in range(self.obj_slots):
+        for idx in range(logits_coef.shape[0]):
             coef = torch.softmax(logits_coef[:idx + 1], dim=0)
             log_coef = nn_func.log_softmax(logits_coef[:idx + 1], dim=0)
             coef_le_sum = coef.cumsum(0)
@@ -283,55 +313,49 @@ class Model(nn.Module):
             part4 = -(coef * log_coef).sum(0)
             kappa2_list.append(part1 + part2 + part3 + part4)
         kappa2 = torch.stack(kappa2_list)
-        loss_pres_5 = zeta * (log_zeta - kappa1) + (1 - zeta) * (log1m_zeta - kappa2)
-        loss_pres = loss_pres_1 + loss_pres_2 + loss_pres_3 + loss_pres_4 + loss_pres_5
-        loss_pres = loss_pres.sum([0, *range(2, loss_pres.dim())])
-        # Back
-        loss_bck = compute_kld_normal(result_bck['bck_mu'], result_bck['bck_logvar'], 0, 0, 1)
-        loss_bck = loss_bck.sum([*range(1, loss_bck.dim())])
-        # STN
-        loss_stn = compute_kld_normal(result_obj['stn_mu'], result_obj['stn_logvar'],
-                                      self.prior_stn_mu, self.prior_stn_logvar, self.prior_stn_invvar)
-        loss_stn = loss_stn.sum([0, *range(2, loss_stn.dim())])
-        # Objects
-        loss_obj = compute_kld_normal(result_obj['obj_mu'], result_obj['obj_logvar'], 0, 0, 1)
-        loss_obj = loss_obj.sum([0, *range(2, loss_obj.dim())])
-        return loss_pres + loss_bck + loss_stn + loss_obj
+        kld_5 = zeta * (log_zeta - kappa1) + (1 - zeta) * (log1m_zeta - kappa2)
+        kld = kld_1 + kld_2 + kld_3 + kld_4 + kld_5
+        return kld.sum([0, *range(2, kld.ndim)])
 
-    def compute_step_losses(self, images, result_bck, result_obj, raw_pixel_ll):
-        log_mask = self.compute_log_mask(result_obj['shp'], result_obj['pres'])
+    def compute_step_losses(self, images, result_bck, result_obj):
+        indices = self.compute_indices(images, result_obj)
+        perm_vals = {key: self.permute(result_obj[key], indices)
+                     for key in ['apc', 'shp', 'pres', 'tau1', 'tau2', 'logits_zeta']}
+        mask = self.compute_mask(perm_vals['shp'], perm_vals['pres'])
+        log_mask = self.compute_log_mask(perm_vals['shp'], perm_vals['pres'])
+        raw_pixel_ll = self.compute_raw_pixel_ll(images, result_bck['bck'], perm_vals['apc'])
         masked_pixel_ll = log_mask + raw_pixel_ll
         gamma = nn.functional.softmax(masked_pixel_ll, dim=0)
         log_gamma = nn.functional.log_softmax(masked_pixel_ll, dim=0)
         # Loss NLL
-        loss_nll = -(gamma * raw_pixel_ll).sum([0, *range(2, gamma.dim())])
+        loss_nll = -(gamma * raw_pixel_ll).sum([0, *range(2, gamma.ndim)])
         # Loss KLD
-        loss_kld_part = self.compute_kld_part(result_bck, result_obj)
-        loss_kld_mask = (gamma * (log_gamma - log_mask)).sum([0, *range(2, gamma.dim())])
-        loss_kld = loss_kld_part + loss_kld_mask
+        kld_bck = result_bck['bck_kld']
+        kld_obj = result_obj['obj_kld'].sum(0)
+        kld_stn = result_obj['stn_kld'].sum(0)
+        kld_pres = self.compute_kld_pres(perm_vals)
+        kld_part = kld_bck + kld_obj + kld_stn + kld_pres
+        kld_mask = (gamma * (log_gamma - log_mask)).sum([0, *range(2, gamma.ndim)])
+        # Loss recon
+        recon = (mask * torch.cat([perm_vals['apc'], result_bck['bck'][None]])).sum(0)
+        sq_diff = (recon - images).pow(2)
+        loss_recon = 0.5 * self.normal_invvar * sq_diff.sum([*range(1, sq_diff.ndim)])
         # Loss back prior
-        bck_prior = images.reshape(*images.shape[:-2], -1).median(-1).values[..., None, None]
-        sq_diff = (result_bck['bck'] - bck_prior).pow(2)
-        loss_bck_prior = 0.5 * self.normal_invvar * sq_diff.sum([*range(1, sq_diff.dim())])
-        # Loss back variance
-        bck_var = result_bck['bck_res'].pow(2)
-        loss_bck_var = 0.5 * self.normal_invvar * bck_var.sum([*range(1, bck_var.dim())])
-        # Loss apc variance
-        apc_var = result_obj['apc_crop_res'].pow(2)
-        loss_apc_var = 0.5 * self.normal_invvar * apc_var.sum([0, *range(2, apc_var.dim())])
+        sq_diff = (result_bck['bck'] - images).pow(2)
+        loss_bck_prior = 0.5 * self.normal_invvar * sq_diff.sum([*range(1, sq_diff.ndim)])
         # Losses
-        losses = {'nll': loss_nll, 'kld': loss_kld, 'kld_part': loss_kld_part, 'bck_prior': loss_bck_prior,
-                  'bck_var': loss_bck_var, 'apc_var': loss_apc_var}
-        return losses
+        losses = {'nll': loss_nll, 'kld_bck': kld_bck, 'kld_obj': kld_obj, 'kld_stn': kld_stn, 'kld_pres': kld_pres,
+                  'kld_mask': kld_mask, 'recon': loss_recon, 'bck_prior': loss_bck_prior}
+        return losses, kld_part
 
     @staticmethod
     def compute_ari(mask_true, mask_pred):
         def comb2(x):
             x = x * (x - 1)
-            if x.dim() > 1:
-                x = x.sum([*range(1, x.dim())])
+            if x.ndim > 1:
+                x = x.sum([*range(1, x.ndim)])
             return x
-        num_pixels = mask_true.sum([*range(1, mask_true.dim())])
+        num_pixels = mask_true.sum([*range(1, mask_true.ndim)])
         mask_true = mask_true.reshape(
             [mask_true.shape[0], mask_true.shape[1], 1, mask_true.shape[-2] * mask_true.shape[-1]])
         mask_pred = mask_pred.reshape(
@@ -357,10 +381,10 @@ class Model(nn.Module):
         ari_obj = self.compute_ari(labels, mask_oh_obj)
         # MSE
         sq_diff = (recon - images).pow(2)
-        mse = sq_diff.mean([*range(1, sq_diff.dim())])
+        mse = sq_diff.mean([*range(1, sq_diff.ndim)])
         # Log-likelihood
         pixel_ll = torch.logsumexp(log_mask + raw_pixel_ll, dim=1)
-        ll = pixel_ll.sum([*range(1, pixel_ll.dim())])
+        ll = pixel_ll.sum([*range(1, pixel_ll.ndim)])
         # Count
         pres_true = labels.reshape(*labels.shape[:-3], -1).max(-1).values
         if self.seg_bck:
