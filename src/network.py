@@ -268,27 +268,29 @@ class NetworkCrop(nn.Module):
         mu, logvar = self.enc_obj(x_crop).chunk(2, dim=-1)
         return tau1, tau2, logits_zeta, mu, logvar
 
-    def decode(self, logits_zeta, mu, logvar, grid_full, temp, hard):
-        if hard:
-            dist_pres = torch_dist.bernoulli.Bernoulli(logits=logits_zeta)
-            pres = dist_pres.sample()
-        else:
-            dist_pres = torch_dist.relaxed_bernoulli.RelaxedBernoulli(temp, logits=logits_zeta)
-            pres = dist_pres.rsample()
+    def decode(self, logits_zeta, mu, logvar, grid_full, temp_pres, temp_shp, hard):
         sample = reparameterize_normal(mu, logvar)
         apc_crop = self.dec_apc(sample)
         logits_shp_crop = self.dec_shp(sample)
         shp_crop = torch.sigmoid(logits_shp_crop)
+        if hard:
+            pres = torch_dist.bernoulli.Bernoulli(logits=logits_zeta).sample()
+            shp_hard_crop = torch_dist.bernoulli.Bernoulli(logits=logits_shp_crop).sample()
+        else:
+            pres = torch_dist.relaxed_bernoulli.RelaxedBernoulli(temp_pres, logits=logits_zeta).rsample()
+            shp_hard_crop = torch_dist.relaxed_bernoulli.RelaxedBernoulli(temp_shp, logits=logits_shp_crop).rsample()
         apc = nn_func.grid_sample(apc_crop, grid_full, align_corners=False)
         shp = nn_func.grid_sample(shp_crop, grid_full, align_corners=False)
-        return pres, apc, shp, apc_crop, shp_crop
+        shp_hard = nn_func.grid_sample(shp_hard_crop, grid_full, align_corners=False)
+        return pres, apc, shp, shp_hard, apc_crop, shp_crop
 
-    def forward(self, x_full, x_crop, grid_full, temp, hard):
+    def forward(self, x_full, x_crop, grid_full, temp_pres, temp_shp, hard):
         tau1, tau2, logits_zeta, mu, logvar = self.encode(x_full, x_crop)
-        pres, apc, shp, apc_crop, shp_crop = self.decode(logits_zeta, mu, logvar, grid_full, temp, hard)
+        pres, apc, shp, shp_hard, apc_crop, shp_crop = self.decode(
+            logits_zeta, mu, logvar, grid_full, temp_pres, temp_shp, hard)
         kld = compute_kld_normal(mu, logvar, self.prior_mu, self.prior_logvar)
         result = {
-            'pres': pres, 'apc': apc, 'shp': shp, 'apc_crop': apc_crop, 'shp_crop': shp_crop,
+            'pres': pres, 'apc': apc, 'shp': shp, 'shp_hard': shp_hard, 'apc_crop': apc_crop, 'shp_crop': shp_crop,
             'tau1': tau1, 'tau2': tau2, 'logits_zeta': logits_zeta, 'obj_kld': kld,
         }
         return result

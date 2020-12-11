@@ -5,27 +5,20 @@ import torch.utils.data as utils_data
 
 class Dataset(utils_data.Dataset):
 
-    def __init__(self, config, data):
+    def __init__(self, data):
         super(Dataset, self).__init__()
         self.images = torch.tensor(data['image'])
-        self.segments = torch.tensor(data['segment'])
-        self.overlaps = torch.tensor(data['overlap'])
-        self.layers = torch.tensor(data['layers']) if 'layers' in data else None
-        self.data_slots = self.segments.max() + 1
-        self.seg_bck = config['seg_bck']
-        self.seg_overlap = config['seg_overlap']
+        self.data_slots = data['segment'].max() + 1
+        self.segments = torch.tensor(data['segment'].max() - data['segment'])
+        self.overlaps = torch.tensor(data['overlap'] > 1)
+        self.layers = torch.tensor(data['layers'][:, ::-1].copy()) if 'layers' in data else None
 
     def __getitem__(self, idx):
         image = self.images[idx].float() / 255
         segment = self.segments[idx].long().unsqueeze_(0)
-        label = torch.zeros([self.data_slots, *segment.shape[1:]]).scatter_(0, segment, 1)
-        if not self.seg_bck:
-            label = label[1:]
-        if not self.seg_overlap:
-            valid = (self.overlaps[idx] <= 1).float().unsqueeze_(0)
-            label *= valid
-        label.unsqueeze_(-3)
-        data = {'image': image, 'label': label}
+        segment = torch.zeros([self.data_slots, *segment.shape[1:]]).scatter_(0, segment, 1).unsqueeze_(-3)
+        overlap = self.overlaps[idx].float().unsqueeze_(-3)
+        data = {'image': image, 'segment': segment, 'overlap': overlap}
         if self.layers is not None:
             data['layers'] = self.layers[idx].float() / 255
         return data
@@ -50,7 +43,7 @@ def get_data_loaders(config):
             else:
                 assert image_shape == data['image'].shape[-3:]
             data_loaders[phase] = utils_data.DataLoader(
-                Dataset(config, data),
+                Dataset(data),
                 batch_size=config['batch_size'],
                 num_workers=config['num_workers'],
                 shuffle=(phase == 'train'),

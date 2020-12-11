@@ -4,13 +4,13 @@ This is the code repository of the paper ["Generative Modeling of Infinite Occlu
 
 ### Dependencies
 
-- pytorch == 1.4
-- torchvision == 0.5
-- numpy == 1.18
+- pytorch == 1.6
+- torchvision == 0.7
+- numpy == 1.19
 - h5py == 2.8
 - pyyaml == 5.3
-- scipy == 1.4
-- scikit-learn == 0.22
+- scipy == 1.5
+- scikit-learn == 0.23
 
 ### Datasets
 

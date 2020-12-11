@@ -27,10 +27,18 @@ phase_param:
     step_wt: null
 
 loss_coef:
-  temp:
+  temp_pres:
     epoch: []
     value: [2.0, 0.5]
     linear: [false]
+  temp_shp:
+    epoch: []
+    value: [10.0, 0.5]
+    linear: [false]
+  ratio_mixture:
+    epoch: []
+    value: [1.0, 1.0]
+    linear: [true]
   bck_prior:
     epoch: [25]
     value: [0.2, 0.0, 0.0]
