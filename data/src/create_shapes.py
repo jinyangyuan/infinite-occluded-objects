@@ -4,7 +4,7 @@ import os
 from common import generate_objects, create_dataset
 
 
-if __name__ == '__main__':
+def main():
     # Arguments
     parser = argparse.ArgumentParser()
     parser.add_argument('--name')
@@ -50,11 +50,16 @@ if __name__ == '__main__':
          [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
          [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]])
     elements = [square, triangle, triangle[::-1, :].copy()]
-    elements = [n[None].repeat(2, axis=0) for n in elements]
-    back = np.zeros((2, args.image_height, args.image_width))
-    back[-1] = 1
+    elements = [n[..., None].repeat(2, axis=-1) for n in elements]
+    back = np.zeros((args.image_height, args.image_width, 2))
+    back[..., -1] = 1
     elements = {'back': back, 'objects': elements}
     elements = {key: elements for key in ['train', 'valid', 'test']}
     # Objects
     objects = generate_objects(args, elements)
     create_dataset(os.path.join(args.folder_outputs, args.name), objects)
+    return
+
+
+if __name__ == '__main__':
+    main()

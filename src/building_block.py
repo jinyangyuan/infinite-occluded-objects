@@ -27,13 +27,9 @@ def get_linear_ln(in_features, out_features, activation=None):
 
 
 def get_enc_conv_ln(in_channels, out_channels, kernel_size, stride, activation=None):
-    if kernel_size == 1:
-        layers = []
-    else:
-        pad_1 = (kernel_size - 1) // 2
-        pad_2 = kernel_size - 1 - pad_1
-        layers = [nn.ZeroPad2d((pad_1, pad_2, pad_1, pad_2))]
-    layers.append(nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride))
+    assert kernel_size % 2 == 1
+    padding = kernel_size // 2
+    layers = [nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)]
     normalization = LayerNormConv(out_channels)
     layers = add_nonlinearity(layers, normalization, activation)
     return layers
@@ -102,16 +98,16 @@ class EncoderBlock(nn.Module):
         assert len(channel_list) == len(kernel_list)
         assert len(channel_list) == len(stride_list)
         layers = []
-        in_channels, in_height, in_width = in_shape
+        in_ch, in_ht, in_wd = in_shape
         for num_channels, kernel_size, stride in zip(channel_list, kernel_list, stride_list):
-            layers += get_enc_conv_ln(in_channels, num_channels, kernel_size, stride, activation=activation)
-            in_channels = num_channels
-            in_height = (in_height - 1) // stride + 1
-            in_width = (in_width - 1) // stride + 1
+            layers += get_enc_conv_ln(in_ch, num_channels, kernel_size, stride, activation=activation)
+            in_ch = num_channels
+            in_ht = (in_ht - 1) // stride + 1
+            in_wd = (in_wd - 1) // stride + 1
         self.conv = nn.Sequential(*layers)
         self.linear = LinearBlock(
             hidden_list=hidden_list,
-            in_features=in_channels * in_height * in_width,
+            in_features=in_ch * in_ht * in_wd,
             out_features=out_features,
             activation=activation,
         )
@@ -132,20 +128,20 @@ class DecoderBlock(nn.Module):
         assert len(channel_list_rev) == len(kernel_list_rev)
         assert len(channel_list_rev) == len(stride_list_rev)
         layers = []
-        out_channels, out_height, out_width = out_shape
+        out_ch, out_ht, out_wd = out_shape
         layer_act = None
         for num_channels, kernel_size, stride in zip(channel_list_rev, kernel_list_rev, stride_list_rev):
-            in_height = (out_height - 1) // stride + 1
-            in_width = (out_width - 1) // stride + 1
-            sub_layers = get_dec_conv_ln(num_channels, out_channels, kernel_size, in_size=[in_height, in_width],
-                                         out_size=[out_height, out_width], activation=layer_act)
+            in_ht = (out_ht - 1) // stride + 1
+            in_wd = (out_wd - 1) // stride + 1
+            sub_layers = get_dec_conv_ln(num_channels, out_ch, kernel_size, in_size=[in_ht, in_wd],
+                                         out_size=[out_ht, out_wd], activation=layer_act)
             layers = sub_layers + layers
-            out_channels = num_channels
-            out_height = in_height
-            out_width = in_width
+            out_ch = num_channels
+            out_ht = in_ht
+            out_wd = in_wd
             layer_act = activation
         hidden_list = [*reversed(hidden_list_rev)]
-        out_features = out_channels * out_height * out_width
+        out_features = out_ch * out_ht * out_wd
         if layer_act is not None:
             hidden_list.append(out_features)
             out_features = None
@@ -156,7 +152,7 @@ class DecoderBlock(nn.Module):
             activation=activation,
         )
         self.conv = nn.Sequential(*layers)
-        self.in_shape = [out_channels, out_height, out_width]
+        self.in_shape = [out_ch, out_ht, out_wd]
 
     def forward(self, x):
         x = self.linear(x)

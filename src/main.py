@@ -19,10 +19,8 @@ def get_config():
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--use_timestamp', action='store_true')
-    parser.add_argument('--save_detail', action='store_true')
-    parser.add_argument('--seg_overlap', action='store_true')
-    parser.add_argument('--file_ckpt', default='ckpt.pickle')
-    parser.add_argument('--file_model', default='model.pickle')
+    parser.add_argument('--file_ckpt', default='ckpt.pth')
+    parser.add_argument('--file_model', default='model.pth')
     args = parser.parse_args()
     with open(args.path_config) as f:
         config = yaml.safe_load(f)

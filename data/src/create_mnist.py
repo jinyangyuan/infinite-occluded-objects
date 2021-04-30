@@ -9,11 +9,11 @@ def create_element(image):
     image = image[image.sum(1) != 0][:, image.sum(0) != 0] / 255
     value = np.full_like(image, image.max())
     mask = image / value
-    element = np.stack([value, mask])
+    element = np.stack([value, mask], axis=-1)
     return element
 
 
-if __name__ == '__main__':
+def main():
     # Arguments
     parser = argparse.ArgumentParser()
     parser.add_argument('--name')
@@ -36,10 +36,15 @@ if __name__ == '__main__':
         for phase, train in zip(['train', 'test'], [True, False])
     }
     elements = {key: [create_element(np.array(n[0])) for n in val] for key, val in mnist.items()}
-    back = np.zeros((2, args.image_height, args.image_width))
-    back[-1] = 1
+    back = np.zeros((args.image_height, args.image_width, 2))
+    back[..., -1] = 1
     elements = {key: {'back': back, 'objects': elements[key_prev]}
                 for key, key_prev in zip(['train', 'valid', 'test'], ['train', 'train', 'test'])}
     # Objects
     objects = generate_objects(args, elements)
     create_dataset(os.path.join(args.folder_outputs, args.name), objects)
+    return
+
+
+if __name__ == '__main__':
+    main()

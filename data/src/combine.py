@@ -4,7 +4,7 @@ import os
 from common import save_dataset
 
 
-if __name__ == '__main__':
+def main():
     # Arguments
     parser = argparse.ArgumentParser()
     parser.add_argument('--folder')
@@ -27,3 +27,8 @@ if __name__ == '__main__':
     save_dataset(os.path.join(args.folder, args.name), images, labels, objects)
     for file in files_in.values():
         os.remove(file)
+    return
+
+
+if __name__ == '__main__':
+    main()

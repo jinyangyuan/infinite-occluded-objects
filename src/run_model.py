@@ -1,11 +1,17 @@
+import gzip
 import h5py
 import math
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 import numpy as np
 import os
+import pickle
 import torch
 import torch.optim as optim
+from matplotlib.patches import Rectangle
 from torch.utils.tensorboard import SummaryWriter
-from metric import compute_ami, compute_order, select_by_order, compute_ooa, compute_layer_mse, compute_iou_f1
+from metric import compute_metrics
 
 
 def compute_loss_coef(config, epoch):
@@ -31,12 +37,67 @@ def compute_loss_coef(config, epoch):
     return loss_coef
 
 
-def get_step_wt(config):
-    if config['step_wt'] is None:
-        step_wt = torch.ones([1, config['num_steps'] + 1])
-    else:
-        step_wt = torch.tensor([config['step_wt']]).reshape(1, config['num_steps'] + 1)
-    return step_wt.cuda()
+def compute_overview(config, images, results, dpi=150):
+    def convert_image(image):
+        image = np.moveaxis(image, 0, 2)
+        if image.shape[2] == 1:
+            image = np.repeat(image, 3, axis=2)
+        return image
+    def plot_image(ax, image, xlabel=None, ylabel=None, color=None):
+        plot = ax.imshow(image, interpolation='bilinear')
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_xlabel(xlabel, color='k' if color is None else color, fontfamily='monospace') if xlabel else None
+        ax.set_ylabel(ylabel, color='k' if color is None else color, fontfamily='monospace') if ylabel else None
+        ax.xaxis.set_label_position('top')
+        return plot
+    def plot_rectangle(ax, val_scl, val_trs, val_pres):
+        image_ht, image_wd = image_batch.shape[-2:]
+        image_size = np.array([image_wd, image_ht]) - 1
+        rect_center = (val_trs + 1) * 0.5 * image_size
+        rect_size = val_scl * image_size
+        anchor_x, anchor_y = rect_center - 0.5 * rect_size
+        size_x, size_y = rect_size
+        edgecolor = 'red' if val_pres else 'green'
+        ax.add_patch(Rectangle((anchor_x, anchor_y), size_x, size_y, edgecolor=edgecolor, fill=False))
+        return
+    def get_overview(fig_idx):
+        image = image_batch[fig_idx]
+        recon = recon_batch[fig_idx]
+        apc = apc_batch[fig_idx]
+        shp = shp_batch[fig_idx]
+        pres = pres_batch[fig_idx]
+        scl = scl_batch[fig_idx]
+        trs = trs_batch[fig_idx]
+        rows, cols = 2, apc.shape[0] + 1
+        fig, axes = plt.subplots(rows, cols, figsize=(cols, rows + 0.2), dpi=dpi)
+        plot_image(axes[0, 0], convert_image(image), xlabel='scene')
+        plot_image(axes[1, 0], convert_image(recon))
+        for idx in range(apc.shape[0]):
+            xlabel = 'obj_{}'.format(idx) if idx < apc.shape[0] - 1 else 'back'
+            color = [1.0, 0.5, 0.0] if pres[idx] >= 128 else [0.0, 0.5, 1.0]
+            plot_image(axes[0, idx + 1], convert_image(apc[idx]), xlabel=xlabel, color=color)
+            plot_image(axes[1, idx + 1], convert_image(shp[idx]))
+            if idx < apc.shape[0] - 1:
+                plot_rectangle(axes[1, idx + 1], scl[idx], trs[idx], pres[idx] >= 128)
+        fig.tight_layout(pad=0)
+        fig.canvas.draw()
+        width, height = fig.canvas.get_width_height()
+        out = np.frombuffer(fig.canvas.tostring_rgb(), dtype='uint8').reshape(height, width, -1)
+        plt.close(fig)
+        return out
+    summ_image_count = config['summ_image_count']
+    image_batch = images[:summ_image_count].data.cpu().numpy()
+    recon_batch = results['recon'][:summ_image_count].data.cpu().numpy()
+    apc_batch = results['apc'][:summ_image_count].data.cpu().numpy()
+    shp_batch = results['shp'][:summ_image_count].data.cpu().numpy()
+    pres_batch = results['pres'][:summ_image_count].data.cpu().numpy()
+    scl_batch = results['scl'][:summ_image_count].data.cpu().numpy()
+    trs_batch = results['trs'][:summ_image_count].data.cpu().numpy()
+    overview_list = [get_overview(idx) for idx in range(summ_image_count)]
+    overview = np.concatenate(overview_list, axis=0)
+    overview = np.moveaxis(overview, 2, 0)
+    return overview
 
 
 def train_model(config, data_loaders, net):
@@ -68,14 +129,11 @@ def train_model(config, data_loaders, net):
             print('Epoch: {}/{}'.format(epoch, config['num_epochs'] - 1))
             for phase in phase_list:
                 phase_param = config['phase_param'][phase]
-                step_wt_base = get_step_wt(phase_param)
                 net.train(phase == 'train')
                 sum_losses, sum_metrics = {}, {}
                 num_data = 0
                 for idx_batch, data in enumerate(data_loaders[phase]):
-                    data = {key: val.cuda(non_blocking=True) for key, val in data.items()}
                     batch_size = data['image'].shape[0]
-                    step_wt = step_wt_base.expand(batch_size, -1)
                     if phase == 'train':
                         enable_grad = True
                         ratio_mixture = loss_coef['ratio_mixture']
@@ -88,11 +146,15 @@ def train_model(config, data_loaders, net):
                         temp_pres = None
                         temp_shp = None
                         hard = True
+                    if idx_batch == 0 and epoch % config['summ_image_intvl'] == 0:
+                        with torch.set_grad_enabled(False):
+                            results, metrics, losses = net(data, phase_param, ratio_mixture, temp_pres, temp_shp, hard)
+                        overview = compute_overview(config, data['image'], results)
+                        writer.add_image(phase.capitalize(), overview, global_step=epoch)
+                        writer.flush()
                     with torch.set_grad_enabled(enable_grad):
                         results, metrics, losses = net(
-                            data['image'], data['segment'], data['overlap'], phase_param['num_slots'],
-                            phase_param['num_steps'], step_wt, ratio_mixture, temp_pres, temp_shp, hard,
-                        )
+                            data, phase_param, ratio_mixture, temp_pres, temp_shp, hard, require_extra=False)
                     for key, val in losses.items():
                         if key in sum_losses:
                             sum_losses[key] += val.sum().item()
@@ -110,10 +172,6 @@ def train_model(config, data_loaders, net):
                             [loss_coef[key] * val.mean() for key, val in losses.items() if key != 'compare']).sum()
                         loss_opt.backward()
                         optimizer.step()
-                    if idx_batch == 0 and epoch % config['summ_image_intvl'] == 0:
-                        overview = net.module.compute_overview(data['image'], results)
-                        writer.add_image(phase.capitalize(), overview, global_step=epoch)
-                        writer.flush()
                 mean_losses = {key: val / num_data for key, val in sum_losses.items()}
                 mean_metrics = {key: val / num_data for key, val in sum_metrics.items()}
                 if epoch % config['summ_scalar_intvl'] == 0:
@@ -149,122 +207,77 @@ def train_model(config, data_loaders, net):
 
 
 def test_model(config, data_loaders, net):
-    def get_path_save():
+    def get_path_detail():
         return os.path.join(config['folder_out'], '{}.h5'.format(phase))
+    def get_path_metric():
+        return os.path.join(config['folder_out'], '{}.pkl'.format(phase))
     phase_list = [n for n in config['phase_param'] if n not in ['train', 'valid']]
     for phase in phase_list:
-        path_save = get_path_save()
-        if os.path.exists(path_save):
-            raise FileExistsError(path_save)
+        path_detail = get_path_detail()
+        if os.path.exists(path_detail):
+            raise FileExistsError(path_detail)
     path_model = os.path.join(config['folder_out'], config['file_model'])
     net.load_state_dict(torch.load(path_model))
     net.train(False)
     for phase in phase_list:
         phase_param = config['phase_param'][phase]
-        step_wt_base = get_step_wt(phase_param)
-        path_save = get_path_save()
+        path_detail = get_path_detail()
         data_key = phase_param['key'] if 'key' in phase_param else phase
-        with h5py.File(path_save, 'w') as f:
-            all_metrics = {}
+        results_all = {}
+        for data in data_loaders[data_key]:
+            results = {}
             for idx_run in range(config['num_tests']):
-                if idx_run == 0 and config['save_detail']:
-                    details = {key: [] for key in ['apc', 'shp', 'pres']}
+                with torch.set_grad_enabled(False):
+                    sub_results, _, _ = net(data, phase_param)
+                for key, val in sub_results.items():
+                    if key in ['scl', 'trs']:
+                        continue
+                    val = val.data.cpu().numpy()
+                    if key != 'pres':
+                        val = np.moveaxis(val, -3, -1)
+                    if key in results:
+                        results[key].append(val)
+                    else:
+                        results[key] = [val]
+            for key, val in results.items():
+                val = np.stack(val)
+                if key in results_all:
+                    results_all[key].append(val)
                 else:
-                    details = None
-                sum_metrics, sum_metrics_extra = {}, {}
-                num_data = 0
-                for data in data_loaders[data_key]:
-                    data = {key: val if key == 'layers' else val.cuda(non_blocking=True) for key, val in data.items()}
-                    batch_size = data['image'].shape[0]
-                    step_wt = step_wt_base.expand(batch_size, -1)
-                    with torch.set_grad_enabled(False):
-                        results, metrics, _ = net(data['image'], data['segment'], data['overlap'],
-                                                  phase_param['num_slots'], phase_param['num_steps'], step_wt)
-                    data = {key: val.data.cpu().numpy() for key, val in data.items()}
-                    results = {key: val.data.cpu().numpy() for key, val in results.items()}
-                    segment_true = data['segment'][:, :-1].argmax(1)
-                    if config['seg_overlap']:
-                        segment_valid = data['segment'][:, -1] == 0
+                    results_all[key] = [val]
+        with h5py.File(path_detail, 'w') as f:
+            for key, val in results_all.items():
+                f.create_dataset(key, data=np.concatenate(val, axis=1), compression='gzip')
+    for phase in phase_list:
+        batch_size = config['batch_size']
+        phase_param = config['phase_param'][phase]
+        data_key = phase_param['key'] if 'key' in phase_param else phase
+        path_detail = get_path_detail()
+        metrics_all = {}
+        with h5py.File(config['path_data'], 'r') as f_data, h5py.File(path_detail, 'r') as f_result:
+            data = {key: f_data[data_key][key] for key in f_data[data_key]}
+            results_all = {key: f_result[key] for key in f_result}
+            for offset in range(0, data['image'].shape[0], batch_size):
+                sub_data = {key: val[offset:offset + batch_size] for key, val in data.items()}
+                sub_results_all = {key: val[:, offset:offset + batch_size] for key, val in results_all.items()}
+                for key, val in sub_data.items():
+                    if key in ['segment', 'overlap']:
+                        sub_data[key] = val.astype(np.int)
                     else:
-                        segment_valid = (data['segment'][:, -1] + data['overlap']) == 0
-                    segment_pred_all = results['segment_all'].squeeze(1)
-                    segment_pred_obj = results['segment_obj'].squeeze(1)
-                    metrics['ami_all'] = compute_ami(segment_true, segment_pred_all, segment_valid)
-                    metrics['ami_obj'] = compute_ami(segment_true, segment_pred_obj, segment_valid)
-                    metrics_extra = {}
-                    if 'layers' in data:
-                        shp_true = data['layers'][:, :, -1:]
-                        part_cumprod = np.concatenate([
-                            np.ones((shp_true.shape[0], 1, *shp_true.shape[2:]), dtype=shp_true.dtype),
-                            np.cumprod(1 - shp_true[:, :-1], 1),
-                        ], axis=1)
-                        mask_true = shp_true * part_cumprod
+                        sub_data[key] = val.astype(np.float) / 255
+                sub_results_all = {key: val.astype(np.float) / 255 for key, val in sub_results_all.items()}
+                sub_metrics_all = compute_metrics(config, sub_data, sub_results_all)
+                for key, val in sub_metrics_all.items():
+                    if key in metrics_all:
+                        metrics_all[key].append(val)
                     else:
-                        mask_true = data['segment']
-                    mask_pred = results['mask']
-                    if not config['seg_overlap']:
-                        mask_true *= 1 - data['overlap'][:, None]
-                        mask_pred *= 1 - data['overlap'][:, None]
-                    if 'layers' in data:
-                        region_order_true = shp_true
-                        region_order_pred = results['shp']
-                    else:
-                        region_order_true = mask_true
-                        region_order_pred = mask_pred
-                    order_cost = -(region_order_true[:, :-1, None] * region_order_pred[:, None, :-1])
-                    order_cost = order_cost.reshape(*order_cost.shape[:-3], -1).sum(-1)
-                    order = compute_order(order_cost)
-                    mask_sel = select_by_order(mask_pred, order)
-                    metrics_extra['iou_part'], metrics_extra['f1_part'] = compute_iou_f1(mask_true, mask_sel)
-                    if 'layers' in data:
-                        layers = data['layers']
-                        apc_sel = select_by_order(results['apc'], order)
-                        shp_sel = select_by_order(results['shp'], order)
-                        metrics_extra['iou_full'], metrics_extra['f1_full'] = compute_iou_f1(shp_true, shp_sel)
-                        metrics_extra['order'] = compute_ooa(layers, order)
-                        metrics_extra['layer_mse'] = compute_layer_mse(layers, apc_sel, shp_sel)
-                    for key, val in metrics.items():
-                        if key in sum_metrics:
-                            sum_metrics[key] += val.sum().item()
-                        else:
-                            sum_metrics[key] = val.sum().item()
-                    for key, val in metrics_extra.items():
-                        if key in sum_metrics_extra:
-                            sum_metrics_extra[key][0] += val[0]
-                            sum_metrics_extra[key][1] += val[1]
-                        else:
-                            sum_metrics_extra[key] = list(val)
-                    num_data += batch_size
-                    if details is not None:
-                        for key, val in details.items():
-                            val.append((np.clip(results[key], 0, 1) * 255).astype(np.uint8))
-                mean_metrics = {key: val / num_data for key, val in sum_metrics.items()}
-                mean_metrics.update({key: val[0] / val[1] for key, val in sum_metrics_extra.items()})
-                for key, val in mean_metrics.items():
-                    if key in all_metrics:
-                        all_metrics[key].append(val)
-                    else:
-                        all_metrics[key] = [val]
-                if details is not None:
-                    f.create_group('detail')
-                    for key, val in details.items():
-                        f['detail'].create_dataset(key, data=np.concatenate(val), compression='gzip')
-            f.create_group('metric')
-            for key, val in all_metrics.items():
-                f['metric'].create_dataset(key, data=np.array(val, dtype=np.float32))
-            metrics_mean = {key: np.mean(val) for key, val in all_metrics.items()}
-            metrics_std = {key: np.std(val) for key, val in all_metrics.items()}
-            format_list = [
-                ('ARI_All', '3f'), ('ARI_Obj', '3f'), ('AMI_All', '3f'), ('AMI_Obj', '3f'),
-                ('IOU_Full', '3f'), ('IOU_Part', '3f'), ('F1_Full', '3f'), ('F1_Part', '3f'),
-                ('Count', '3f'), ('Order', '3f'), ('LL', '1f'), ('MSE', '2e'), ('Layer_MSE', '2e'),
-            ]
-            print(phase)
-            for name, mean_fmt in format_list:
-                key = name.lower()
-                if key in all_metrics:
-                    print(name)
-                    print(('Mean: {:.' + mean_fmt + '}').format(metrics_mean[key]))
-                    print('Std:  {:.2e}'.format(metrics_std[key]))
-                    print()
+                        metrics_all[key] = [val]
+        for key, val in metrics_all.items():
+            if isinstance(val[0], tuple):
+                metrics_all[key] = tuple([np.concatenate(n, axis=1) for n in zip(*val)])
+            else:
+                metrics_all[key] = np.concatenate(val, axis=1)
+        path_metric = get_path_metric()
+        with gzip.open(path_metric, 'wb') as f:
+            pickle.dump(metrics_all, f)
     return

@@ -47,9 +47,9 @@ loss_coef:
 normal_scale: 0.3
 lr: 2.0e-4
 batch_size: 128
-num_workers: 1
 num_epochs: 100
 num_tests: 5
+seg_overlap: false
 
 state_back_size: 256
 state_full_size: 256
