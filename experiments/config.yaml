@@ -1,53 +1,56 @@
-summ_scalar_intvl: 1
-summ_image_intvl: 1
-summ_image_count: 10
+ckpt_intvl: 1000
+summ_image_count: 8
 
 phase_param:
   train:
     num_slots: 5
-    num_steps: 2
-    step_wt: null
+    num_iters: 2
+    iter_wt: null
   valid:
     num_slots: 5
-    num_steps: 2
-    step_wt: null
+    num_iters: 2
+    iter_wt: null
   test:
     num_slots: 5
-    num_steps: 2
-    step_wt: null
+    num_iters: 2
+    iter_wt: null
   general_4:
     key: general
     num_slots: 5
-    num_steps: 2
-    step_wt: null
+    num_iters: 2
+    iter_wt: null
   general_10:
     key: general
     num_slots: 11
-    num_steps: 2
-    step_wt: null
+    num_iters: 2
+    iter_wt: null
 
 loss_coef:
   temp_pres:
-    epoch: []
+    step: []
     value: [2.0, 0.5]
     linear: [false]
   temp_shp:
-    epoch: []
+    step: []
     value: [10.0, 0.5]
     linear: [false]
   ratio_mixture:
-    epoch: []
+    step: []
     value: [1.0, 1.0]
     linear: [true]
   bck_prior:
-    epoch: [25]
+    step: [25000]
     value: [0.2, 0.0, 0.0]
     linear: [true, true]
+  reg_shp:
+    step: []
+    value: [0.0, 0.0]
+    linear: [true]
 
 normal_scale: 0.3
 lr: 2.0e-4
 batch_size: 128
-num_epochs: 100
+num_steps: 100000
 num_tests: 5
 seg_overlap: false
 
